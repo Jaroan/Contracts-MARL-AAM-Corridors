@@ -1,10 +1,6 @@
-# Cooperation and Fairness in Multi-Agent Reinforcement Learning (Fair-MARL)
+# Assume-Guarantee Contracts + MARL for Air Traffic Control
 
-This repository contains the code for the paper **"[Cooperation and Fairness in Multi-Agent Reinforcement Learning](https://dl.acm.org/doi/full/10.1145/3702012)"**, which introduces a method to incorporate fairness for multi-agent navigation tasks. The method builds on the InforMARL framework and extends it to ensure fair cooperation in scenarios like MPE's simple spread (coverage) and formation.
-
-Paper Link: :page_facing_up: :paperclip: [https://arxiv.org/abs/2410.14916](https://arxiv.org/abs/2410.14916)
-
-Paper Website: :computer: :globe_with_meridians: [Website](https://jaroan.github.io/jasminejerrya/Fair_MARL.html)
+This repository contains the code for the work Assume-Guarantee Contracts + MARL for Air Traffic Control,
 
 ## Table of Contents
 - [Introduction](#introduction)
@@ -21,17 +17,9 @@ Paper Website: :computer: :globe_with_meridians: [Website](https://jaroan.github
 
 ## Introduction
 
-The Fair-MARL method addresses fairness in cooperative multi-agent reinforcement learning (MARL), where agents must not only achieve task success but also do so in a manner that promotes fairness in navigation for all agents. This is particularly relevant in tasks involving navigation, such as:
-
-- **Coverage Navigation**: Agents must spread out to cover target locations.
-- **Formation**: Agents must arrange themselves in specific formations.
-
-Our approach extends the **InforMARL** framework to include fairness in the goal assignment and rewards, enabling agents to learn policies that are both efficient and fair. 
 
 ## Features
 
-- **Fair Goal Assignment**: Incorporates fairness principles in the goal assignment process.
-- **Fairness Reward**: Includes a fairness reward that is based on agents's distance traveled.
   
 ## Environment
 
@@ -41,7 +29,7 @@ You can find the MPE environment here: [Multi-Agent Particle Environment (MPE)](
 
 ## Installation
 
-To get started with the Fair-MARL method, clone this repository and install the required dependencies. Ensure you have pip version pip==23.1.2. Installing torch beforehand ensures the correct installation of other components.
+To get started with the ContractsinMARL method, clone this repository and install the required dependencies. Ensure you have pip version pip==23.1.2. Installing torch beforehand ensures the correct installation of other components.
 
 > NOTE: Using a conda environment is preferred. Please use the following command to create a conda environment with the correct python version.
 
@@ -94,18 +82,18 @@ After training, you can evaluate the trained agents by running:
 
 ```bash
 python onpolicy/scripts/eval_mpe.py \
---model_dir='model_weights/FA_FR/unicycle_model' \
+--model_dir='model_weights/tube/rot_inv' \
 --render_episodes=2 \
 --world_size=3 \
 --num_agents=3 \
 --num_obstacles=0 \
---seed=0 \
+--seed=1 \
 --num_landmarks=3 \
---episode_length=50 \
+--episode_length=200 \
 --use_dones=False \
 --collaborative=False --model_name='FA' \
---scenario_name='nav_fairassign_fairrew_formation_graph' \
---dynamics_type='unicycle_vehicle' \
+--scenario_name='nav_metered_one_goal_graph_rotate_tube_july' \
+--dynamics_type='air_taxi' \
 --goal_rew=30 \
 --fair_rew=1 \
 --save_gifs \
@@ -113,7 +101,8 @@ python onpolicy/scripts/eval_mpe.py \
 --num_walls=0 \
 --zeroshift=5 \
 --min_obs_dist 0.5 \
---total_actions 5
+--total_actions 5 \
+--formation_type 'point'
 ```
 
 This will load the trained model and evaluate its performance in the specified environment. Additional parameters for evaluation, such as the number of agents, can be modified in the configuration file or passed as command-line arguments.
@@ -140,18 +129,14 @@ This will load the trained model and evaluate its performance in the specified e
 └── onpolicy/                          # MPE environment files (if necessary)
 ```
 
-- **`multiagent/custom_scenarios/navigation_graph.py`**: Implements the Fair-MARL reinforcement learning algorithm.
-- **`marl_fair_assign.py`**: Contains the logic for fair goal assignment.
+- **`multiagent/custom_scenarios/nav_metered_one_goal_graph_rotate_tube_july.py`**: Implements the Fair-MARL reinforcement learning algorithm.
 
 - We have created adocument detailing the network architecture here:
 - We have created a document for easy understandng of our codebase here
 
 ## Results
 
-Here we summarize the results from the experiments. The Fair-MARL method achieves **fairer goal assignment** and **better cooperation** compared to baseline methods. For example:
-
-- **Coverage navigation**: Fair-MARL agents spread out more equitably to different target locations.
-- **Formation**: Agents arrange themselves in stable formations while ensuring fairness in positional assignments.
+Here we summarize the results from the experiments. 
 
 For detailed results and analysis, please refer to our paper.
 
@@ -160,13 +145,7 @@ For detailed results and analysis, please refer to our paper.
 If you find this repository helpful in your research, please cite the corresponding paper:
 
 ```bibtex
-@article{aloor2024cooperation,
-  title={Cooperation and Fairness in Multi-Agent Reinforcement Learning},
-  author={Aloor, Jasmine and Nayak, Siddharth Nagar and Dolan, Sydney and Balakrishnan, Hamsa},
-  journal={Journal on Autonomous Transportation Systems},
-  year={2024},
-  publisher={ACM New York, NY},
-  doi={10.1145/3702012}
+@article{
 }
 
 ```
@@ -190,8 +169,10 @@ Please file an issue if you have any questions or requests about the code or the
 
 ## Related papers
 
-1. InforMARL: [https://nsidn98.github.io/InforMARL/](https://nsidn98.github.io/InforMARL/) Paper: [Scalable Multi-Agent Reinforcement Learning through Intelligent Information Aggregation](https://arxiv.org/abs/2211.02127)
-2. [Satellite Navigation and Coordination with Limited Information Sharing](https://arxiv.org/abs/2211.03658)
+1. Layered-Safe-MARL
+2. Fair-MARL
+2. InforMARL: [https://nsidn98.github.io/InforMARL/](https://nsidn98.github.io/InforMARL/) Paper: [Scalable Multi-Agent Reinforcement Learning through Intelligent Information Aggregation](https://arxiv.org/abs/2211.02127)
+3. [Satellite Navigation and Coordination with Limited Information Sharing](https://arxiv.org/abs/2211.03658)
 
 ## Contributing
 
