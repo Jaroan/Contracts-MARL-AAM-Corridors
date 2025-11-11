@@ -5,7 +5,15 @@ import numpy as np
 import csv
 from scipy.integrate import solve_ivp
 
-from multiagent.config import DoubleIntegratorConfig, UnicycleVehicleConfig
+from multiagent.config import UnicycleVehicleConfig, DoubleIntegratorConfig, AirTaxiConfig
+from multiagent.safety_filter import (
+    HjDataHandle,
+    AirTaxiSafetyHandle,
+    DoubleIntegratorSafetyHandle,
+    DoubleIntegratorSafetyHandleWithExponentialCBF
+)
+
+
 # function to check for team or single agent scenarios
 def is_list_of_lists(lst):
     if isinstance(lst, list) and lst:  # Check if it's a non-empty list
@@ -134,12 +142,15 @@ class UnicycleVehicleXYState(BaseEntityState):
         self.theta = 0
         self.speed = 0
     
-    def reset_velocity(self, theta=None):
+    def reset_velocity(self, theta=None, speed=None):
         if theta is not None:
             self.theta = theta
         else:
             self.theta = np.random.uniform(0, 2 * np.pi)
-        self.speed = self.min_speed
+        if speed is not None:
+            self.speed = speed
+        else:
+            self.speed = self.min_speed
     
     def __getitem__(self, idx):
         return self.values[idx]
@@ -215,6 +226,120 @@ class DoubleIntegratorXYState(BaseEntityState):
     
     def __getitem__(self, idx):
         return self.values[idx]
+    
+
+class AirTaxiXYState(BaseEntityState):
+    """
+    AirTaxi / AirTaxi dynamics model.
+    
+    State representation (dim=4):
+        [0] p_x     : position x
+        [1] p_y     : position y
+        [2] theta   : heading angle (rad)
+        [3] v       : forward speed (km/s)
+
+    Actions:
+        action[0] = dtheta (angular rate, rad/s)
+        action[1] = dv     (longitudinal acceleration, km/s^2)
+
+    This model evolves heading + speed (like a Dubins/kinematic car) 
+    rather than vx, vy directly.
+    """
+    def __init__(self, v_min, v_max):
+        super(AirTaxiXYState, self).__init__(4)
+        self.min_speed = v_min
+        self.max_speed = v_max
+
+    # --- Position ---
+    @property
+    def p_pos(self):
+        return self.values[:2]
+
+    @p_pos.setter
+    def p_pos(self, val):
+        self.values[:2] = val
+
+    # --- Heading ---
+    @property
+    def theta(self):
+        return self.values[2]
+
+    @theta.setter
+    def theta(self, val):
+        self.values[2] = val
+
+    # --- Forward speed ---
+    @property
+    def speed(self):
+        return self.values[3]
+
+    @speed.setter
+    def speed(self, val):
+        self.values[3] = val
+
+    # --- Velocity vector (derived from speed & heading) ---
+    @property
+    def p_vel(self):
+        return np.array([
+            self.speed * np.cos(self.theta),
+            self.speed * np.sin(self.theta)
+        ])
+
+    # --- Continuous dynamics ---
+    @staticmethod
+    def dstate(state, action):
+        # state = [x, y, theta, v]
+        # action = [dtheta, dv]
+        dp_x = state[3] * np.cos(state[2])
+        dp_y = state[3] * np.sin(state[2])
+        dtheta = action[0]
+        dv = action[1]
+        return np.array([dp_x, dp_y, dtheta, dv])
+
+    # --- Numerical integration with RK45 ---
+    def update_state(self, action, dt):
+        def ode(t, y):
+            return self.dstate(y, action)
+
+        y0 = self.values
+        sol = solve_ivp(ode, [0, dt], y0, method="RK45")
+        self.values = sol.y[:, -1]
+
+        # enforce speed bounds
+        if self.speed > self.max_speed:
+            self.speed = self.max_speed
+        if self.speed < self.min_speed:
+            self.speed = self.min_speed
+
+        # update distance/time counters
+        self.p_dist += self.speed * dt
+        self.time += dt
+
+    # --- Stop vehicle ---
+    def stop(self):
+        self.theta = 0.0
+        self.speed = 0.0
+
+    # --- Reset velocity ---
+    def reset_velocity(self, theta=None, speed=None):
+        if theta is not None:
+            self.theta = theta
+        else:
+            self.theta = np.random.uniform(0, 2 * np.pi)
+
+        if speed is not None:
+            self.speed = speed
+        else:
+            self.speed = self.min_speed
+    
+    def __getitem__(self, idx):
+        return self.values[idx]
+
+    def to_array(self):
+        """Return the state as a numpy array (x, y, theta, v)."""
+        return np.copy(self.values)
+
+
 
 
 # action of the agent
@@ -286,7 +411,11 @@ class Entity(object):
 class Landmark(Entity):
     def __init__(self):
         super(Landmark, self).__init__()
-
+        # if heading and speed are None, goal-reaching reward is only based on position.
+        # if they have specific values, we evaluate reward based on heading and speed as well.
+        self.heading = None # rad
+        self.speed = None # m/s
+        
 # properties of agent entities
 class Agent(Entity):
     def __init__(self, dynamics_type: EntityDynamicsType):
@@ -318,6 +447,13 @@ class Agent(Entity):
             self.config_class = UnicycleVehicleConfig
             self.state = UnicycleVehicleXYState(v_min=UnicycleVehicleConfig.V_MIN, v_max=UnicycleVehicleConfig.V_MAX)
             self.min_speed = self.state.min_speed
+        elif dynamics_type == EntityDynamicsType.AirTaxiXY:
+            self.config_class = AirTaxiConfig
+            self.state = AirTaxiXYState(
+                v_min=AirTaxiConfig.V_MIN,
+                v_max=AirTaxiConfig.V_MAX
+            )
+            self.min_speed = self.state.min_speed
         else:
             raise NotImplementedError("Dynamics type not implemented")
         self.max_speed = self.state.max_speed
@@ -334,9 +470,10 @@ class Agent(Entity):
 # multi-agent world
 class World(object):
     def __init__(self, dynamics_type: EntityDynamicsType, 
-                separation_distance=None,  total_actions: int = 5):
+                separation_distance=None,  total_actions: int = 5, all_args=None):
         assert dynamics_type in EntityDynamicsType, "Invalid dynamics type"
         self.dynamics_type = dynamics_type
+        self.all_args = all_args
         # if we want to construct graphs with the entities 
         self.graph_mode = False
         self.edge_list = None
@@ -360,12 +497,47 @@ class World(object):
             self.config_class = DoubleIntegratorConfig
         elif dynamics_type == EntityDynamicsType.UnicycleVehicleXY:
             self.config_class = UnicycleVehicleConfig
+        elif dynamics_type == EntityDynamicsType.AirTaxiXY:
+            self.config_class = AirTaxiConfig
         else:
             raise NotImplementedError("Dynamics type not implemented")
-        self.dt = self.config_class.DT
+
+        # --- SAFETY FILTER INITIALIZATION ---
+        self.safety_handle = None
+        self.all_args = all_args
+
+        # Only activate if explicitly enabled
+        if all_args is not None and getattr(all_args, "use_safety_filter", False):
+            # ✅ AirTaxi / AirTaxi dynamics
+            if self.dynamics_type in [
+                EntityDynamicsType.UnicycleVehicleXY,
+                EntityDynamicsType.AirTaxiXY,
+            ]:
+                hj_data = HjDataHandle(
+                    all_args.safety_value_fn,
+                    AirTaxiConfig.SEPARATION_DISTANCE
+                )
+                self.safety_handle = AirTaxiSafetyHandle(AirTaxiConfig, hj_data)
+                print("[SAFETY] AirTaxi safety filter initialized.")
+
+            # ✅ Double Integrator dynamics
+            elif self.dynamics_type == EntityDynamicsType.DoubleIntegratorXY:
+                if all_args.safety_filter_type == "hj":
+                    hj_data = HjDataHandle(
+                        all_args.safety_value_fn,
+                        DoubleIntegratorConfig.SEPARATION_DISTANCE
+                    )
+                    self.safety_handle = DoubleIntegratorSafetyHandle(hj_data)
+                    print("[SAFETY] DoubleIntegrator HJ safety filter initialized.")
+                else:
+                    self.safety_handle = DoubleIntegratorSafetyHandleWithExponentialCBF()
+                    print("[SAFETY] DoubleIntegrator exponential CBF safety filter initialized.")
+        # ------------------------------------
+
+        self.dt = getattr(self.config_class, "DT", 0.1)
         self.simulation_time = 0.0
         # simulation timestep
-        self.dt = 0.1
+        # self.dt = 0.1
         # physical damping
         self.damping = 0.25
         # contact response parameters
@@ -390,7 +562,7 @@ class World(object):
         self.cached_dist_vect = None
         self.cached_dist_mag = None
 
-        self.coordination_range = self.config_class.COMMUNICATION_RANGE
+        self.coordination_range = self.config_class.COORDINATION_RANGE
         self.min_dist_thresh = self.config_class.DISTANCE_TO_GOAL_THRESHOLD
 
 
@@ -469,82 +641,140 @@ class World(object):
                 if obstacle.name == f'obstacle {id}':
                     return obstacle
             raise ValueError(f"Obstacle with id: {id} doesn't exist in the world")
+    
+
+    def get_action(self):
+        """
+        Convert each agent.action (which may be an Action object) into a flat np.ndarray
+        of the correct shape for the current dynamics.
+        - AirTaxi/Unicycle: [dtheta, dv]
+        - DoubleIntegrator: [ax, ay]
+        """
+        actions = []
+        for agent in self.agents:
+            a = agent.action  # may be Action object or already an array
+
+            # Pull underlying numeric control
+            if hasattr(a, "u") and a.u is not None:
+                u = np.asarray(a.u, dtype=float).reshape(-1)
+            elif isinstance(a, (list, tuple, np.ndarray)):
+                u = np.asarray(a, dtype=float).reshape(-1)
+            else:
+                # Fallback: try to use .u if present, else error
+                try:
+                    u = np.asarray(a, dtype=float).reshape(-1)
+                except Exception as e:
+                    raise TypeError(f"Unsupported action type for agent {agent.id}: {type(a)}") from e
+
+            # Validate shape by dynamics
+            if self.dynamics_type in (EntityDynamicsType.UnicycleVehicleXY, EntityDynamicsType.AirTaxiXY):
+                # expecting [dtheta, dv]
+                if u.size != 2:
+                    raise ValueError(f"Agent {agent.id} action must be length 2 (dtheta, dv). Got {u.size}: {u}")
+            elif self.dynamics_type == EntityDynamicsType.DoubleIntegratorXY:
+                # expecting [ax, ay]
+                if u.size != 2:
+                    raise ValueError(f"Agent {agent.id} action must be length 2 (ax, ay). Got {u.size}: {u}")
+            else:
+                raise NotImplementedError(f"Unknown dynamics type: {self.dynamics_type}")
+
+            actions.append(u)
+        return actions
+
+
 
     # update state of the world
     def step(self):
 
         raw_action_list = self.get_action()
-        safe_action_list = raw_action_list
 
-        # integrate physical state
+        # Apply safety filter (if active)
+        if getattr(self, "safety_handle", None) is not None:
+            safe_action_list = []
+            safety_violations = []
+
+            # Collect agent states and (optional) goals
+            states = [agent.state.to_array() for agent in self.agents]
+            actions = raw_action_list
+            waypoints = [getattr(agent, "goal", np.zeros(2)) for agent in self.agents]
+
+            for i, ego_agent in enumerate(self.agents):
+                other_states = [states[j] for j in range(len(self.agents)) if j != i]
+                other_actions = [actions[j] for j in range(len(self.agents)) if j != i]
+                other_waypoints = [waypoints[j] for j in range(len(self.agents)) if j != i]
+
+                # Apply the safety filter
+                filtered_action, filtered, _ = self.safety_handle.apply_safety_filter(
+                    states[i],
+                    actions[i],
+                    waypoints[i],
+                    other_states,
+                    other_actions,
+                    other_waypoints
+                )
+
+                # Store filtered action + violation flag
+                safe_action_list.append(filtered_action)
+                safety_violations.append(filtered)
+
+                # Track how much the filter changed the action (for reward shaping)
+                ego_agent.action_diff = np.linalg.norm(np.array(actions[i]) - np.array(filtered_action))
+
+            # Store safety metrics for logging / reward computation
+            self._last_safety_violations = safety_violations
+
+            # Optional debug output
+            # if any(safety_violations):
+            #     print(f"[SAFETY] {sum(safety_violations)} violations detected this step.")
+        else:
+            # No safety filter → actions unchanged
+            safe_action_list = raw_action_list
+            self._last_safety_violations = [False] * len(self.agents)
+
+            # Ensure consistent reward API
+            for agent in self.agents:
+                agent.action_diff = 0.0
+
+
+        # Integrate dynamics using filtered or raw actions
         self.update_agent_state(safe_action_list)
 
-        # set actions for scripted agents 
+        # Update scripted agents (if any)
         for agent in self.scripted_agents:
             agent.t += self.dt
             agent.action = agent.action_callback(agent, self)
-        # # gather forces applied to entities
-        # p_force = [None] * len(self.entities)
-        # # apply agent physical controls
-        # p_force = self.apply_action_force(p_force)
-        # # apply environment forces
-        # p_force = self.apply_environment_force(p_force)
-        # # integrate physical state
-        # self.integrate_state(p_force)
-        # update agent state
-        if is_list_of_lists(self.agents):
-            for team in self.agents:
-                for agent in team:
-                    agent.t += self.dt
-                    self.update_agent_communication_state(agent)
-        else:
-            for agent in self.agents:
-                agent.t += self.dt
-                self.update_agent_communication_state(agent)
+
+        # Update agent communications and world distances
+        for agent in self.agents:
+            agent.t += self.dt
+            self.update_agent_communication_state(agent)
+
         if self.cache_dists:
             self.calculate_distances()
 
         self.update_agent_min_relative_distance()
-        
         self.simulation_time += self.dt
+    
 
-    # gather agent action forces
-    def get_action(self):
-        # set applied forces
-        ## agent action has an linear acceleration term and an angular acceleration term
-        action_list = []
-        for i,agent in enumerate(self.agents):
-            if agent.u_noise:
-                # Jason's temporary fix
-                raise NotImplementedError
+    @property
+    def num_safety_violations(self):
+        return sum(self._last_safety_violations) if hasattr(self, "_last_safety_violations") else 0
 
-            action_i = np.array([agent.action.u[0], agent.action.u[1]])
-            action_list.append(action_i)
-       
-        return action_list
+
 
     # gather agent action forces
     def apply_action_force(self, p_force):
-        # set applied forces
-        if is_list_of_lists(self.agents):
-            flattened_agents = [agent for team in self.agents for agent in team]
-            for i,agent in enumerate(flattened_agents):
-                if agent.movable:
-                    noise = np.random.randn(*agent.action.u.shape) * agent.u_noise if agent.u_noise else 0.0
-                    p_force[i] = (
-                                agent.mass * agent.accel if agent.accel is not None 
-                                else agent.mass) * agent.action.u + noise
-        else:
-            for i,agent in enumerate(self.agents):
-                if agent.movable:
-                    noise = np.random.randn(*agent.action.u.shape) * agent.u_noise if agent.u_noise else 0.0
-                    p_force[i] = (
-                                agent.mass * agent.accel if agent.accel is not None 
-                                else agent.mass) * agent.action.u + noise
-                # if agent.id == 8:
-                #     print("agent force",p_force[i])
-                # print("mass",agent.mass,"accel",agent.accel,"action",agent.action.u) 
-                # print("force",p_force[i])                
+
+        for i,agent in enumerate(self.agents):
+            if agent.movable:
+                noise = np.random.randn(*agent.action.u.shape) * agent.u_noise if agent.u_noise else 0.0
+                p_force[i] = (
+                            agent.mass * agent.accel if agent.accel is not None 
+                            else agent.mass) * agent.action.u + noise
+            # if agent.id == 8:
+            #     print("agent force",p_force[i])
+            # print("mass",agent.mass,"accel",agent.accel,"action",agent.action.u) 
+            # print("force",p_force[i])                
         return p_force
 
     # gather physical forces acting on entities
@@ -571,7 +801,6 @@ class World(object):
                     if wf is not None:
                         # print("p_force",p_force[a])
                         if p_force[a] is None: p_force[a] = 0.0
-                        csv_data = [wf[0],wf[1],p_force[a][0], p_force[0][0],(p_force[a] + wf)[0],(p_force[a] + wf)[1]]
 
                         p_force[a] = p_force[a] + wf
 

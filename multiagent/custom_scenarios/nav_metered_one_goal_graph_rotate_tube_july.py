@@ -7,10 +7,11 @@
 from typing import Optional, Tuple, List
 import argparse
 import numpy as np
+import math
 from numpy import ndarray as arr
 from scipy import sparse
 
-import scipy.spatial.distance as dist
+# import scipy.spatial.distance as dist
 import os,sys
 sys.path.append(os.path.abspath(os.getcwd()))
 
@@ -19,12 +20,54 @@ sys.path.append(os.path.abspath(os.getcwd()))
 
 from multiagent.core import EntityDynamicsType, World, Agent, Landmark, Entity, Wall
 from multiagent.scenario import BaseScenario
-from multiagent.config import UnicycleVehicleConfig, DoubleIntegratorConfig
-from scipy.optimize import linear_sum_assignment
+from multiagent.config import UnicycleVehicleConfig, DoubleIntegratorConfig, AirTaxiConfig, RewardWeightConfig, RewardBinaryConfig
+# from scipy.optimize import linear_sum_assignment
 from multiagent.custom_scenarios.utils import *
-from marl_fair_assign import solve_fair_assignment
+# from marl_fair_assign import solve_fair_assignment
 
 entity_mapping = {'agent': 0, 'landmark': 1, 'obstacle':2, 'wall':3}
+
+
+
+def direction_alignment_error(theta, theta_ref):
+    """Smallest absolute angle difference in [0, pi]."""
+    d = (theta - theta_ref + np.pi) % (2*np.pi) - np.pi
+    return abs(d)
+
+def cross_track_error(agent_pos, agent_heading, goal_pos):
+    """
+    Signed cross-track distance from agent_pos to the ray starting at goal_pos
+    and pointing along agent_heading.
+    Returns |cross-track| in [0,1] approx by soft-bounding.
+    """
+    # Ray direction
+    ray = np.array([np.cos(agent_heading), np.sin(agent_heading)])
+    v = agent_pos - goal_pos
+    # cross-track magnitude = |v x ray| (2D cross product magnitude)
+    c = abs(v[0]*ray[1] - v[1]*ray[0])
+    # Soft-normalize: treat >1 as 1
+    return float(np.clip(c, 0, 1))
+
+def get_relative_position_from_reference(p, pref, heading_ref):
+    """Rotate (p - pref) into the frame aligned with heading_ref."""
+    d = p - pref
+    c, s = np.cos(heading_ref), np.sin(heading_ref)
+    R = np.array([[c, s], [-s, c]])  # frame where +x is along heading_ref
+    return R @ d
+
+def double_integrator_velocity_error_from_magnetic_field_reference(state, goal, radius=0.2):
+    """
+    LS-MARL uses a heading-aware penalty; for AirTaxi we fallback to distance
+    if we don’t have velocity components. This returns a smooth penalty
+    that’s ~0 near the goal and grows with distance.
+    """
+    p = state.p_pos
+    g = goal.state.p_pos
+    d = np.linalg.norm(p - g)
+    if d <= radius:
+        return 0.0
+    # simple smooth ramp starting after radius
+    return d - radius
 
 
 def get_thetas(poses):
@@ -59,6 +102,10 @@ def leaky_ReLU(x):
 
 
 class Scenario(BaseScenario):
+
+	def get_aspect_ratio_for_scenario(self) -> float:
+		return 1.0
+
 	def make_world(self, args:argparse.Namespace) -> World:
 		"""
 			Parameters in args
@@ -108,6 +155,7 @@ class Scenario(BaseScenario):
 		if not hasattr(self, 'world_size'):
 			self.world_size = args.world_size
 		self.args = args
+		self.world_aspect_ratio = self.get_aspect_ratio_for_scenario()
 		self.num_agents = args.num_agents
 		self.num_scripted_agents = args.num_scripted_agents
 		self.num_obstacles = args.num_obstacles
@@ -116,6 +164,13 @@ class Scenario(BaseScenario):
 		self.collision_rew = args.collision_rew
 		self.formation_rew = args.formation_rew
 		self.goal_rew = args.goal_rew
+		self.min_reward = RewardWeightConfig.MIN_REWARD
+		self.max_reward = RewardWeightConfig.MAX_REWARD
+		self.conflict_rew_scaled = RewardWeightConfig.SAFETY_VIOLATION
+		self.conflict_value_rew_scaled = RewardWeightConfig.HJ_VALUE
+		self.multiple_engagement_rew_scaled = RewardWeightConfig.POTENTIAL_CONFLICT
+		self.diff_from_filtered_action_rew_scaled = RewardWeightConfig.DIFF_FROM_FILTERED_ACTION
+
 		# dummy_pos = np.array([1.0, 0.0])
 		# get_rotated_position_from_relative(dummy_pos, 0.0)
 		self.use_dones = args.use_dones
@@ -164,11 +219,14 @@ class Scenario(BaseScenario):
 			self.min_turn_radius = 0.0
 		else:
 			raise NotImplementedError
-		self.coordination_range = self.config_class.COMMUNICATION_RANGE
+		self.coordination_range = self.config_class.COORDINATION_RANGE
 		self.min_dist_thresh = self.config_class.DISTANCE_TO_GOAL_THRESHOLD
 		self.separation_distance = self.config_class.COLLISION_DISTANCE
 
 		self.phase_reached = np.zeros(self.num_agents)  ## keeps track of which phase each agent is in when it first enters it
+
+		self.phase_reward_cooldown_steps = self.episode_length/10                   # steps to cool down 0->1 reward
+
 		# scripted agent dynamics are fixed to double integrator for now (as it was originally)
 		scripted_agent_dynamics_type = EntityDynamicsType.DoubleIntegratorXY
 		# if not hasattr(args, 'max_edge_dist'):
@@ -183,11 +241,11 @@ class Scenario(BaseScenario):
 		self.curriculum_ratio = 1.0
 		self.max_edge_dist = self.coordination_range
 		####################
-		world = World(dynamics_type=self.dynamics_type)
+		world = World(dynamics_type=self.dynamics_type, all_args = args)
 		# graph related attributes
 		world.cache_dists = True # cache distance between all entities
 		world.graph_mode = True
-		world.graph_feat_type = args.graph_feat_type
+		world.graph_feat_type = getattr(args, "graph_feat_type", "relative")
 		world.world_length = args.episode_length
 		# metrics to keep track of
 		world.current_time_step = 0
@@ -215,6 +273,7 @@ class Scenario(BaseScenario):
 		## determine the number of actions from arguments
 		world.total_actions = args.total_actions
 		#############
+
 		# add agents
 		global_id = 0
 		world.agents = [Agent(self.dynamics_type) for i in range(self.num_agents)]
@@ -267,8 +326,15 @@ class Scenario(BaseScenario):
 		self.zeroshift = args.zeroshift
 		self.reset_world(world)
 		world.world_size = self.world_size
-		# world.world_aspect_ratio = self.world_aspect_ratio
+		world.world_aspect_ratio = self.world_aspect_ratio
+
+		if hasattr(self, 'with_background'):
+			world.with_background = self.with_background
+		else:
+			world.with_background = False
 		return world
+
+
 
 	def reset_world(self, world:World, num_current_episode: int = 0) -> None:
 		# print("RESET WORLD")
@@ -303,6 +369,9 @@ class Scenario(BaseScenario):
 		self.wall_length = wall_length * self.world_size/4
 
 		self.phase_reached = np.zeros(self.num_agents)
+		self.entry_reward_cooldown = np.zeros(self.num_agents, dtype=np.int32)
+        # Store previous longitudinal position (s) for progress reward
+		self.prev_proj = np.zeros(self.num_agents, dtype=np.float32)
 
 
 		#################### set colours ####################
@@ -390,13 +459,15 @@ class Scenario(BaseScenario):
 			# 	world.dim_p
 			# )
 			# Add random jitter if needed
-			jitter = 0.2 * np.random.uniform(-10, 10, world.dim_p)
+			jitter = 0.2 * np.random.uniform(-self.world_size, self.world_size, world.dim_p)
 			angle = world.tube_params['angle']
 			# print("jitter", jitter)
 			perp_dir = np.array([np.sin(angle), np.cos(angle)])
 			# print("Entrance", world.tube_params['entrance'], "perp_dir", perp_dir )
 			# print("self.world_size+(num_agents_added) / 5 * perp_dir",( self.world_size+(num_agents_added)) / 5 * perp_dir)
-			random_pos = world.tube_params['entrance'] +  (self.world_size+(num_agents_added)) / 5 * perp_dir + jitter
+			distance_from_entrance = (self.world_size + num_agents_added) / 5
+			# print("distance_from_entrance", distance_from_entrance, "jitter", jitter)
+			random_pos = world.tube_params['entrance'] + distance_from_entrance * perp_dir + jitter
 			# print(f"Random Position for Agent {num_agents_added}: {random_pos}")
 			# input("Press Enter to continue...")
 			# ## shift agents to bottom half of the world
@@ -524,41 +595,96 @@ class Scenario(BaseScenario):
 			'rotation_matrix': rotation_matrix,  # Store for potential future use
 			'formation_direction': formation_direction  # Direction for agent lineup
 		})
+
+		# Precompute tube frame for fast queries
+		L = float(np.linalg.norm(exit - entrance)) + 1e-9
+		corridor_vec = (exit - entrance) / L
+		n_vec = np.array([-corridor_vec[1], corridor_vec[0]], dtype=np.float32)  # left-hand normal
+		world.tube_params.update({
+			'e': corridor_vec,
+			'n': n_vec,
+			'L': L,
+			'half_width': float(self.tube_width) * 0.5
+		})
+
+
+		# Full-width entrance gate settings (tunable)
+		self.gate_front_ratio = getattr(self, 'gate_front_ratio', 0.08)  # inside tube
+		self.gate_back_ratio = getattr(self, 'gate_back_ratio', 0.02)    # just outside entrance
 	
-	def is_in_tube(self, world: World, pos):
-		"""
-		Updated helper function to check if position is inside rotated tube
-		"""
-		entrance = world.tube_params['entrance']
-		exit = world.tube_params['exit']
-		width = world.tube_params['width']
-		angle = world.tube_params['angle']
+
+	# --- Shared geometry helpers (reduce redundancy) ---
+	def _tube_frame(self, world: World):
+		tp = world.tube_params
+		return tp['entrance'], tp['e'], tp['n'], float(tp['L']), float(tp['half_width'])
+
+	def _tube_coords(self, world: World, pos: np.ndarray):
+		"""Return (s, y, L, half_w): longitudinal s from entrance and signed lateral y."""
+		entrance, e, n, L, half_w = self._tube_frame(world)
+		r = np.asarray(pos, dtype=np.float32) - entrance
+		s = float(np.dot(r, e))
+		y = float(np.dot(r, n))
+		return s, y, L, half_w
+
+
+	def _in_tube_rect(self, s: float, y: float, L: float, half_w: float, eps: float = 0.05) -> bool:
+		return (-eps <= s <= L + eps) and (abs(y) <= half_w + eps)
+	
+	def _in_entrance_gate(self, s: float, y: float, L: float, half_w: float, eps: float = 0.05) -> bool:
+		"""Full-width gate spanning the entrance edge: s in [-gate_back, +gate_front], |y|<=half_w."""
+		gate_front = float(self.gate_front_ratio) * L
+		gate_back = float(self.gate_back_ratio) * L
+		return (-gate_back - eps <= s <= gate_front + eps) and (abs(y) <= half_w + eps)
+	
+	# Distance to the full-width entrance edge (rectangle at s=0 with |y|<=half_w)
+	def _entrance_gate_distance(self, s: float, y: float, half_w: float) -> float:
+		# nearest point on entrance edge: (s'=0, y' clamped to [-half_w, half_w])
+		clamped_y = float(np.clip(y, -half_w, half_w))
+		ds = abs(float(s))   # before entrance plane → distance along axis
+		dy = float(y) - clamped_y       # lateral overflow outside corridor width
+		return float(np.hypot(ds, dy))
+
+	# def is_in_tube(self, world: World, pos):
+	# 	"""
+	# 	Updated helper function to check if position is inside rotated tube
+	# 	"""
+	# 	entrance = world.tube_params['entrance']
+	# 	exit = world.tube_params['exit']
+	# 	width = world.tube_params['width']
+	# 	angle = world.tube_params['angle']
 		
-		# Calculate tube direction vector
-		tube_direction = exit - entrance
-		tube_length = np.linalg.norm(tube_direction)
-		tube_direction = tube_direction / tube_length
+	# 	# Calculate tube direction vector
+	# 	tube_direction = exit - entrance
+	# 	tube_length = np.linalg.norm(tube_direction)
+	# 	tube_direction = tube_direction / tube_length
 		
-		# Calculate vector from entrance to position
-		pos_vector = pos - entrance
+	# 	# Calculate vector from entrance to position
+	# 	pos_vector = pos - entrance
 		
-		# Project position onto tube direction
-		projection_length = np.dot(pos_vector, tube_direction)
+	# 	# Project position onto tube direction
+	# 	projection_length = np.dot(pos_vector, tube_direction)
 		
-		# Check if point is between entrance and exit
-		if projection_length < 0 or projection_length > tube_length:
-			return False
+	# 	# Check if point is between entrance and exit
+	# 	if projection_length < 0 or projection_length > tube_length:
+	# 		return False
 			
-		# Calculate perpendicular distance to tube centerline
-		perpendicular_vector = pos_vector - projection_length * tube_direction
-		perpendicular_distance = np.linalg.norm(perpendicular_vector)
+	# 	# Calculate perpendicular distance to tube centerline
+	# 	perpendicular_vector = pos_vector - projection_length * tube_direction
+	# 	perpendicular_distance = np.linalg.norm(perpendicular_vector)
 		
-		# Check if point is within tube width
-		return perpendicular_distance <= width/2
+	# 	# Check if point is within tube width
+	# 	return perpendicular_distance <= width/2
+
+	# --- Optimized queries using the frame ---
+	def is_in_tube(self, world: World, pos: np.ndarray) -> bool:
+		s, y, L, half_w = self._tube_coords(world, pos)
+		return self._in_tube_rect(s, y, L, half_w)
 	
 	def get_agent_phase(self, agent: Agent, world: World):
 		pos = agent.state.p_pos
-		in_tube = self.is_in_tube(world, pos)
+		# in_tube = self.is_in_tube(world, pos)
+		s, y, L, half_w = self._tube_coords(world, pos)
+		in_tube = self._in_tube_rect(s, y, L, half_w)
 		exit_to_pos = pos - world.tube_params['exit']
 		tube_direction = world.tube_params['exit'] - world.tube_params['entrance']
 		tube_direction = tube_direction / np.linalg.norm(tube_direction)
@@ -570,7 +696,12 @@ class Scenario(BaseScenario):
 		tube_width = world.tube_params['width']
 		tube_length = np.linalg.norm(world.tube_params['exit'] - world.tube_params['entrance'])
 
-		valid_entrance = (0 <= proj < 0.1 * tube_length) and (perp_dist < tube_width / 2)
+		# valid_entrance = (0 <= proj < 0.1 * tube_length) and (perp_dist < tube_width / 2)
+		valid_entrance = self._in_entrance_gate(s, y, L, half_w)
+		# Decrement cooldown here once per call
+		if self.entry_reward_cooldown[agent.id] > 0:
+			# print("Decrementing cooldown for agent", agent.id, "from", self.entry_reward_cooldown[agent.id])
+			self.entry_reward_cooldown[agent.id] -= 1
 
 		# Only check valid_entrance when transitioning from phase 0 to 1
 		if not in_tube and not passed_tube:
@@ -697,6 +828,38 @@ class Scenario(BaseScenario):
 			agent_info['Min_time_to_goal'] = agent.goal_min_time
 		return agent_info
 
+	# ======== Layered-Safe-MARL style helpers ========
+
+	def get_agent_current_goal(self, agent, world):
+		"""Return a lightweight goal object with position, heading, and speed."""
+		gid = self.goal_match_index[agent.id]
+		goal = type("TmpGoal", (), {})()
+		goal.state = type("TmpState", (), {})()
+		goal.state.p_pos = self.landmark_poses[gid]
+		vec = goal.state.p_pos - agent.state.p_pos
+		goal.heading = float(np.arctan2(vec[1], vec[0]))
+		# For AirTaxi, midrange cruise speed
+		try:
+			from multiagent.config import AirTaxiConfig
+			goal.speed = 0.5 * (AirTaxiConfig.V_MIN + AirTaxiConfig.V_MAX)
+		except Exception:
+			goal.speed = float(agent.state.speed)
+		return goal
+
+	def agent_distance_to_current_goal(self, agent, world):
+		g = self.get_agent_current_goal(agent, world)
+		return float(np.linalg.norm(agent.state.p_pos - g.state.p_pos))
+
+	def evaluate_agent_goal_reached(self, agent, world):
+		return self.agent_distance_to_current_goal(agent, world) < self.min_dist_thresh
+
+	def get_effective_curriculum_ratio_sloped(self, start=0.0, end=1.0):
+		return getattr(self, "curriculum_ratio", 1.0) * (end - start) + start
+
+	def get_effective_curriculum_ratio_stair(self):
+		return 1.0
+
+
 	# check collision of entity with obstacles and walls
 	def is_obstacle_collision(self, pos, entity_size:float, world:World) -> bool:
 		# pos is entity position "entity.state.p_pos"
@@ -761,6 +924,19 @@ class Scenario(BaseScenario):
 				break
 		return collision
 
+	
+	def is_confliction(self, a, b):
+		"""True if agents are within the minimum separation distance."""
+		d = np.linalg.norm(a.state.p_pos - b.state.p_pos)
+		return d <= self.separation_distance
+
+	def is_in_engagement(self, a, b):
+		"""True if agents are within a larger 'engagement' range."""
+		engagement_distance = getattr(self, "engagement_distance", 1.5 * self.separation_distance)
+		d = np.linalg.norm(a.state.p_pos - b.state.p_pos)
+		return d <= engagement_distance
+
+
 	# get min time required to reach to goal without obstacles
 	def min_time(self, agent:Agent, world:World) -> float:
 		assert agent.max_speed is not None, "Agent needs to have a max_speed."
@@ -797,42 +973,163 @@ class Scenario(BaseScenario):
 				return False
 
 
-	def _bipartite_min_dists(self, dists):
-		ri, ci = linear_sum_assignment(dists)
-		min_dists = dists[ri, ci]
-		return min_dists
+	# def _bipartite_min_dists(self, dists):
+	# 	ri, ci = linear_sum_assignment(dists)
+	# 	min_dists = dists[ri, ci]
+	# 	return min_dists
 	
+	def reward_reach_goal(self, agent, world) -> float:
+		rew = 0.0
+		curriculum_ratio_sloped = self.get_effective_curriculum_ratio_sloped()
+		curriculum_ratio_stair = self.get_effective_curriculum_ratio_stair()
+
+		agent_goal = self.get_agent_current_goal(agent, world)
+		if agent_goal.heading is None:
+			raise ValueError("Goal heading is not set.")
+		if agent_goal.speed is None:
+			raise ValueError("Goal speed is not set.")
+
+		goal_pos = agent_goal.state.p_pos
+		goal_heading = agent_goal.heading
+		goal_speed = agent_goal.speed
+
+		agent_pos = agent.state.p_pos
+		agent_heading = agent.state.theta
+		agent_speed = agent.state.speed
+
+		heading_err = direction_alignment_error(agent_heading, goal_heading)
+		heading_perf = 1.0 - float(np.clip(heading_err / getattr(self, "goal_heading_error_thresh", np.deg2rad(20.0)), 0, 1))
+
+		speed_err = abs(agent_speed - goal_speed)
+		speed_err_max = getattr(self, "goal_speed_error_thresh", 0.5)
+		speed_err_norm = float(np.clip(speed_err / speed_err_max, 0, 1))
+
+		dist_to_goal = self.agent_distance_to_current_goal(agent, world)
+		curriculum_ratio_airtaxi = self.get_effective_curriculum_ratio_sloped(start=0.25, end=0.75)
+		if getattr(self, "use_safety_filter", False):
+			curriculum_ratio_airtaxi = 1.0
+
+		# Reward on reach
+		if self.evaluate_agent_goal_reached(agent, world):
+			speed_perf = 1.0 - speed_err_norm
+			xtrack = cross_track_error(agent_pos, agent_heading, goal_pos)
+			xtrack_perf = 1.0 - xtrack
+			perf = heading_perf * speed_perf * xtrack_perf
+			if self.dynamics_type == EntityDynamicsType.DoubleIntegratorXY:
+				goal_rew = self.goal_rew * perf
+			else:
+				perf_cur = perf * curriculum_ratio_airtaxi + (1 - curriculum_ratio_airtaxi)
+				goal_rew = self.goal_rew * perf_cur
+			if getattr(self, "use_masking", False):
+				if not agent.done:
+					rew += goal_rew
+			else:
+				rew += goal_rew
+
+		# If not reached, penalize
+		if not agent.done:
+			relative_pos = get_relative_position_from_reference(agent_pos, goal_pos, goal_heading)
+			relative_heading = agent_heading - goal_heading
+			grid_ttr = getattr(self, "grid_ttr", None)
+			if grid_ttr is None:
+				if not getattr(self, "use_safety_filter", False):
+					heading_aware_pen = 3.0 * double_integrator_velocity_error_from_magnetic_field_reference(agent.state, agent_goal, 2 * self.min_dist_thresh)
+					heading_aware_pen *= float(np.clip(1 - curriculum_ratio_sloped, 0, 1))
+					rew -= heading_aware_pen
+			else:
+				try:
+					relative_state = np.array([relative_pos[0], relative_pos[1], relative_heading, agent.state.speed])
+					ttr_goal = self.grid_ttr.interpolate(self.ttr_values, relative_state)
+					if math.isnan(ttr_goal):
+						ttr_goal = getattr(self, "ttr_max", 25.0)
+				except Exception:
+					ttr_goal = getattr(self, "ttr_max", 25.0)
+				rew -= 0.04 * ttr_goal
+
+			if self.dynamics_type == EntityDynamicsType.DoubleIntegratorXY:
+				time_penalty_weight = 1.0
+				if getattr(self, "use_safety_filter", False):
+					rew -= time_penalty_weight
+				else:
+					rew -= time_penalty_weight * curriculum_ratio_sloped
+			else:
+				rew -= speed_err_norm * curriculum_ratio_airtaxi
+
+		return rew
+
+	def reward_safety_violation(self, agent, world) -> float:
+		rew = 0.0
+		for a in world.agents:
+			if a.id != agent.id and self.is_confliction(a, agent) and not a.done:
+				rew += self.conflict_rew_scaled
+		return rew
+
+	def reward_multiple_engagement(self, agent, world) -> float:
+		"""Penalize when >2 agents are close and closing."""
+		engagement_count = 0
+		engagement_pen = 0.0
+		for a in world.agents:
+			if a.id != agent.id and self.is_in_engagement(a, agent) and not a.done:
+				rel = a.state.p_pos - agent.state.p_pos
+				d = np.linalg.norm(rel)
+				closeness = 1.0 - float(np.clip((d - self.separation_distance) / (getattr(self, "engagement_distance", 1.5*self.separation_distance) - self.separation_distance), 0, 1))
+				# distance direction and closure rate
+				dir_vec = rel / (np.linalg.norm(rel) + 1e-8)
+				rel_vel = a.state.p_vel - agent.state.p_vel
+				closing_rate = np.inner(dir_vec, rel_vel)
+				closing_rate = abs(min(0.0, closing_rate))  # penalize if closing
+				engagement_pen += closing_rate * closeness
+				engagement_count += 1
+		if engagement_count > 1:
+			return self.multiple_engagement_rew_scaled * engagement_pen
+		return 0.0
+
+	def reward_diff_from_filtered_action(self, agent) -> float:
+		if not agent.done:
+			return self.diff_from_filtered_action_rew_scaled * getattr(agent, "action_diff", 0.0)
+		return 0.0
+
+	def reward_hj_value(self, agent, world, eps_hj=0.4) -> float:
+		rew = 0.0
+		# Needs world.get_hj_value_between_two_agents (see step 4)
+		if not hasattr(world, "get_hj_value_between_two_agents"):
+			return 0.0
+		for a in world.agents:
+			if a.id != agent.id and not a.done:
+				v = world.get_hj_value_between_two_agents(agent, a)
+				conflict_val_pen = abs(min(v - eps_hj, 0.0))
+				rew += self.conflict_value_rew_scaled * conflict_val_pen
+		return rew
 
 
 	def reward(self, agent: Agent, world: World) -> float:
+		"""
+		Combined fairness-phase reward + safety-aware augmentation.
+		Fully backward compatible with previous functionality.
+		"""
+
+		# ======== PHASE-BASED & FAIRNESS REWARD (unchanged core) ========
 		rew = 0
 		current_phase = self.get_agent_phase(agent, world)
+		# last_safety_violations = getattr(world, "_last_safety_violations", [False] * len(world.agents))
 
-		# Common rewards across all phases
-		# Collision penalties
+		# --- Collision penalties (existing) ---
 		if agent.collide:
 			for a in world.agents:
 				if a.id == agent.id:
 					continue
 				if self.is_collision(a, agent):
-					rew -= self.collision_rew*4
-					# print(f"!!!Agent {agent.id} collided with agent {a.id} penalty",self.collision_rew*4 )
-					# print(" self.separation_distance", self.separation_distance)
-					# input("Collision")
-			
-			if self.is_obstacle_collision(pos=agent.state.p_pos,
-										entity_size=agent.size, 
-										world=world):
-				rew -= self.collision_rew*3
-				# print(f"Agent {agent.id} collided with obstacle")
+					rew -= self.collision_rew * 4
+			if self.is_obstacle_collision(pos=agent.state.p_pos, entity_size=agent.size, world=world):
+				rew -= self.collision_rew * 3
 
-		# Calculate tube length
+		# Tube geometry setup
 		tube_direction = world.tube_params['exit'] - world.tube_params['entrance']
 		tube_length = np.linalg.norm(tube_direction)
 		agent_pos = agent.state.p_pos
 		agent_heading = agent.state.theta
 		heading_vec = np.array([np.cos(agent_heading), np.sin(agent_heading)])
-
+		s, y, L, half_w = self._tube_coords(world, agent_pos)
 		front_agents = []
 		back_agents = []
 
@@ -841,182 +1138,87 @@ class Scenario(BaseScenario):
 				continue
 			rel_vec = other.state.p_pos - agent_pos
 			proj = np.dot(rel_vec, heading_vec)
-			if proj > 0:
-				front_agents.append((proj, other))
-			else:
-				back_agents.append((proj, other))
-
-		# Get closest in front and back
+			(front_agents if proj > 0 else back_agents).append((proj, other))
 		front_agent = min(front_agents, key=lambda x: x[0])[1] if front_agents else None
 		back_agent = max(back_agents, key=lambda x: x[0])[1] if back_agents else None
+		desired_spacing = self.separation_distance
 
-		# print("front_agent", front_agent.id if front_agent else "None")
-		# print("back_agent", back_agent.id if back_agent else "None")
-		
-		# Calculate desired spacing based on tube length and number of agents
-		desired_spacing = self.separation_distance # 3 is the number of agents in the tube TODO: harcoded
-
-		# desired_spacing = world.tube_params['width'] / (len(world.agents) + 1)
-		# Reward for line formation
-		# neighbor_dists = [np.linalg.norm(other.state.p_pos - agent.state.p_pos) 
-		# 				for other in world.agents if other is not agent]
-		
-		# Track agent's previous phase if not already stored
+		# --- Phase reward progression (unchanged) ---
 		if not hasattr(agent, 'previous_phase'):
 			agent.previous_phase = 0
-		
-		# ##Modified phase transition handling
 		if current_phase == 2 and current_phase > agent.previous_phase + 1:
-			# Only penalize clear phase skips (e.g., 0 to 2)
-			# print("self.goal_rew",self.goal_rew)
-			rew -= self.goal_rew*3  # Reduced penalty
-			# print(f"Agent {agent.id} penalized for skipping from phase {agent.previous_phase} to {current_phase} rew", rew)
+			rew -= self.goal_rew * 3
 		tube_direction_vector = tube_direction / np.linalg.norm(tube_direction)
 		entrance_to_agent = agent.state.p_pos - world.tube_params['entrance']
 		proj = np.dot(entrance_to_agent, tube_direction_vector)
 		entrance_dist = np.linalg.norm(entrance_to_agent - proj * tube_direction)
 
-		if current_phase == agent.previous_phase+1 and self.phase_reached[agent.id] == current_phase-1:
-			# print("HELLO",agent.id, "current_phase", current_phase, "previous_phase", agent.previous_phase)
-			# print("proj", proj," 0.1 * tube_length", 0.1 * tube_length)
-			# print("entrance_dist", entrance_dist, " 0.2* tube_length", 0.2 * tube_length)
-			# Reward proper phase progression
-			if current_phase == 1 and 0 <= proj < 0.1 * tube_length and entrance_dist <  0.2 * tube_length:
-				# print("Agent pos, entrance, exit", agent.state.p_pos, world.tube_params['entrance'], world.tube_params['exit'])
-				# print("distance check", proj, entrance_dist)
+		if current_phase == agent.previous_phase + 1 and self.phase_reached[agent.id] == current_phase - 1:
+			if current_phase == 1 and 0 <= proj < 0.1 * tube_length and entrance_dist < 0.2 * tube_length:
+				rew += self.goal_rew * 3
+			elif current_phase == 2:
+				rew += self.goal_rew * 3
 
-				# Reward if agent moves into tube after exiting
-				rew += self.goal_rew*3  # Positive reward for proper transition
-				# print(f"Agent {agent.id} properly progressed from phase {agent.previous_phase} to {current_phase} rew", rew)
-			elif current_phase == 2 :
-				# Rewards if agent moves out of tube
-				rew += self.goal_rew*3
-				# print(f"Agent {agent.id} properly progressed from phase {agent.previous_phase} to {current_phase} rew", rew)
-				# Update the global phase tracker if any agent progresses
-
-		# Phase-specific rewards
-		# print("Agent",agent.id,"Phase_reached",self.phase_reached)
-		if current_phase == 0:  # Pre-tube phase
-			# Reward for getting closer to tube entrance
+		# --- Phase-specific logic (unchanged) ---
+		if current_phase == 0:
 			dist_to_entrance = np.linalg.norm(world.tube_params['entrance'] - agent.state.p_pos)
 			rew -= dist_to_entrance
-			# print("Agent", agent.id, " Phase 0 dist_to_entrance", dist_to_entrance, "rew", rew)
 
-			# # Formation reward considering front and back agents
-			# spacing_error = 0
-			# if front_agent:
-			# 	diff = np.linalg.norm(front_agent.state.p_pos - agent.state.p_pos) - desired_spacing
-			# 	spacing_error += np.abs(diff) if diff < 0 else 0
-			# if back_agent:
-			# 	diff = np.linalg.norm(back_agent.state.p_pos - agent.state.p_pos) - desired_spacing
-			# 	spacing_error += np.abs(diff) if diff < 0 else 0
-			# rew -= spacing_error *  self.formation_rew
-			# print("Phase 0 spacing_error",spacing_error)
-			# input("phase 0")
-				
-		elif current_phase == 1:  # In-tube phase
-			# print("formation line",self.formation_rew)
-			# rew += self.formation_rew/2  # Reward for entering tube
-			# Stronger formation rewards inside tube
+		elif current_phase == 1:
 			spacing_error = 0
-			max_spacing_error = 0
 			if front_agent:
-				# print("np.linalg.norm(front_agent.state.p_pos - agent.state.p_pos)", np.linalg.norm(front_agent.state.p_pos - agent.state.p_pos), "desired_spacing", desired_spacing)
 				diff = np.linalg.norm(front_agent.state.p_pos - agent.state.p_pos) - desired_spacing
-				# print("diff", diff)
 				spacing_error += np.abs(diff) if diff < 0 else 0
-				max_spacing_error = max(max_spacing_error, np.abs(diff))
 			if back_agent:
-				# print("np.linalg.norm(back_agent.state.p_pos - agent.state.p_pos)", np.linalg.norm(back_agent.state.p_pos - agent.state.p_pos), "desired_spacing", desired_spacing)
 				diff = np.linalg.norm(back_agent.state.p_pos - agent.state.p_pos) - desired_spacing
-				# print("diff", diff)
-				max_spacing_error = max(max_spacing_error, np.abs(diff))
 				spacing_error += np.abs(diff) if diff < 0 else 0
 			if spacing_error > 0:
-				# print("Phase 1 spacing_error",spacing_error)
 				self.spacing_violation[agent.id] += 1
-			rew -= spacing_error *  self.formation_rew # Higher weight for maintaining formation in tube
-			# print("Phase 1 spacing_error",max_spacing_error)
-			# Progress through tube
+			rew -= spacing_error * self.formation_rew
 			dist_to_exit = np.linalg.norm(world.tube_params['exit'] - agent.state.p_pos)
 			rew -= dist_to_exit
-			# print("dist_to_exit",dist_to_exit, "rew", rew)
-			# print("Agent",agent.id,"Phase 1 spacing_error",spacing_error)
 			self.delta_spacing.append(spacing_error)
 			self.steps_in_corridor[agent.id] += 1
-			# print("delta_spacing",self.delta_spacing)
-			# print("Agent",agent.id,"delta_spacing",self.delta_spacing[agent.id])
-			# input("phase 1")
-	
-		elif current_phase == 2 and self.phase_reached[agent.id] == 0:  # Post-tube phase
-			# print("Agent",agent.id,"post tube phase")
-			# input("Agent entered post tube phase")
-			current_phase = 0  # Reset current phase to 0
+
+		elif current_phase == 2 and self.phase_reached[agent.id] == 0:
+			current_phase = 0
 		else:
 			dist_to_goal = np.linalg.norm(agent.state.p_pos - self.landmark_poses[self.goal_match_index[agent.id]])
 			if dist_to_goal < self.min_dist_thresh:
-				# print("Agent",agent.id,"reached fair goal")
-				if agent.status ==False:
+				if agent.status is False:
 					agent.status = True
 					agent.state.reset_velocity()
-					rew += self.goal_rew*5
+					rew += self.goal_rew * 5
 					self.goal_tracker[agent.id] = self.goal_match_index[agent.id]
-
-					# print("Phase 2 Agent",agent.id,"reached goal")
-
 			else:
-					# print("dist_to_goal",dist_to_goal, "rew", rew)
-					rew -= dist_to_goal
-					# print("Agent",agent.id,"not reached goal",dist_to_goal)
-			# input("phase 2")
+				rew -= dist_to_goal
 
-			# spacing_error = 0
-			# if front_agent:
-			# 	diff = np.linalg.norm(front_agent.state.p_pos - agent.state.p_pos) - desired_spacing
-			# 	spacing_error += np.abs(diff) if diff < 0 else 0
-			# if back_agent:
-			# 	diff = np.linalg.norm(back_agent.state.p_pos - agent.state.p_pos) - desired_spacing
-			# 	spacing_error += np.abs(diff) if diff < 0 else 0
-			# rew -= spacing_error *  self.formation_rew # Higher weight for maintaining formation in tube
-
-		# # # Global formation quality (calculated once per step)
-		# if agent.id == 0:
-		# 	all_spacings = []
-		# 	for a in world.agents:
-		# 		a_neighbor_dists = [np.linalg.norm(other.state.p_pos - a.state.p_pos) 
-		# 						for other in world.agents if other is not a]
-		# 		if len(a_neighbor_dists) >= 2:
-		# 			a_neighbor_dists.sort()
-		# 			all_spacings.extend(a_neighbor_dists[:2])
-		# 	# print("all_spacings",all_spacings)
-		# 	spacing_std = np.std(all_spacings)
-		# 	# self.spacing_min = np.min(all_spacings)
-		# 	# print("Global spacing_std",spacing_std*self.formation_rew )
-		# 	rew -= spacing_std *  self.formation_rew  # Reward uniform spacing across all agents
-		# print("Agent",agent.id,"rew",rew)
-
-
-
-		# print("Agent.status",agent.status)
 		if self.phase_reached[agent.id] == 1 and current_phase == 0:
-			# print("Agent",agent.id,"left corridor")
 			self.conformance_percent[agent.id] += 1
-			# print("conformance_percent",self.conformance_percent[agent.id])
-
 		if current_phase > self.phase_reached[agent.id]:
-			# print(f"Agent {agent.id} reached phase {current_phase}")
-			self.phase_reached[agent.id] = current_phase  # Update max phase reached globally
-		## penalize for moving from higher phase to lower phase
+			self.phase_reached[agent.id] = current_phase
 		if current_phase < agent.previous_phase:
-			rew -= self.collision_rew*3
-			# print(f"Agent {agent.id} tried to move back to phase {current_phase} from {agent.previous_phase} rew", rew)
+			rew -= self.collision_rew * 3
 		if current_phase < self.phase_reached[agent.id]:
 			rew -= self.collision_rew
-			# print(f"Agent {agent.id} tried to move back to phase {current_phase} from {self.phase_reached[agent.id]} rew", rew)
-		# Store current phase for next step
 		agent.previous_phase = current_phase
-		# input("Reward calculation complete for agent {}".format(agent.id))
-		return np.clip(rew, -4*self.collision_rew, self.goal_rew*5)
+
+		# --- Base fairness reward clip ---
+		rew = np.clip(rew, -4 * self.collision_rew, self.goal_rew * 5)
+
+		# ======== SAFETY AUGMENTATION ========
+		if getattr(self, "use_safety_filter", False):
+			if RewardBinaryConfig.SAFETY_VIOLATION:
+				rew += self.reward_safety_violation(agent, world)
+			if RewardBinaryConfig.POTENTIAL_CONFLICT:
+				rew += self.reward_multiple_engagement(agent, world)
+			if RewardBinaryConfig.DIFF_FROM_FILTERED_ACTION:
+				rew += self.reward_diff_from_filtered_action(agent)
+			if RewardBinaryConfig.HJ_VALUE:
+				rew += self.reward_hj_value(agent, world)
+
+		# Final clip for global safety-scaled limits
+		return np.clip(rew, self.min_reward, self.max_reward)
 
 
 	def get_agent_nearby_goals(self, agent: Agent, world: World):
@@ -1131,7 +1333,7 @@ class Scenario(BaseScenario):
 		# input("Press Enter to continue...")
 		return goal_pos, closest_goal_occupied, rel_second_closest_goal, goal_history
 
-	'''
+
 	def observation(self, agent: Agent, world: World) -> arr:
 		"""
 		Returns an observation for the agent, including:
@@ -1259,93 +1461,93 @@ class Scenario(BaseScenario):
 			nearest_neighbors,
 			tube_params
 		])
- 	'''
 
 
-	def observation(self, agent: Agent, world: World) -> arr:
-		"""
-		Returns an observation for the agent with rotation invariance:
-		- Keep the same feature order/length as before to preserve training scripts.
-		- All relative vectors (goal, neighbors, tube entrance/exit) are rotated into
-		the agent's heading frame so that the agent's x-axis aligns with its heading.
-		"""
-		# --- Agent state ---
-		agent_pos = agent.state.p_pos
-		agent_heading = float(getattr(agent.state, "theta", getattr(agent.state, "p_ang", 0.0)))
-		agent_speed = float(getattr(agent.state, "speed", np.linalg.norm(agent.state.p_vel)))
-		agent_vel = np.asarray(agent.state.p_vel, dtype=np.float32)
+
+	# def observation(self, agent: Agent, world: World) -> arr:
+	# 	"""
+	# 	Returns an observation for the agent with rotation invariance:
+	# 	- Keep the same feature order/length as before to preserve training scripts.
+	# 	- All relative vectors (goal, neighbors, tube entrance/exit) are rotated into
+	# 	the agent's heading frame so that the agent's x-axis aligns with its heading.
+	# 	"""
+	# 	# --- Agent state ---
+	# 	agent_pos = agent.state.p_pos
+	# 	agent_heading = float(getattr(agent.state, "theta", getattr(agent.state, "p_ang", 0.0)))
+	# 	agent_speed = float(getattr(agent.state, "speed", np.linalg.norm(agent.state.p_vel)))
+	# 	agent_vel = np.asarray(agent.state.p_vel, dtype=np.float32)
 
 
-		ego_agent_pos = np.zeros_like(agent_pos, dtype=np.float32)
+	# 	ego_agent_pos = np.zeros_like(agent_pos, dtype=np.float32)
 
-		# Rotate own velocity into ego frame
-		rot_agent_vel = get_rotated_position_from_relative(agent_vel, agent_heading).astype(np.float32)
+	# 	# Rotate own velocity into ego frame
+	# 	rot_agent_vel = get_rotated_position_from_relative(agent_vel, agent_heading).astype(np.float32)
 
-		# --- Goal related (single fair goal) ---
-		goal_world_pos = self.landmark_poses[self.goal_match_index[agent.id]]
-		rel_goal_vec_world = goal_world_pos - agent_pos
-		goal_pos = get_rotated_position_from_relative(rel_goal_vec_world, agent_heading).astype(np.float32)
+	# 	# --- Goal related (single fair goal) ---
+	# 	goal_world_pos = self.landmark_poses[self.goal_match_index[agent.id]]
+	# 	rel_goal_vec_world = goal_world_pos - agent_pos
+	# 	goal_pos = get_rotated_position_from_relative(rel_goal_vec_world, agent_heading).astype(np.float32)
 
-		# Occupancy flag unchanged
-		closest_goal_occupied = np.array([self.landmark_poses_occupied[self.goal_match_index[agent.id]]], dtype=np.float32)
+	# 	# Occupancy flag unchanged
+	# 	closest_goal_occupied = np.array([self.landmark_poses_occupied[self.goal_match_index[agent.id]]], dtype=np.float32)
 
 		
-		rel_second_closest_goal = goal_pos.copy()
+	# 	rel_second_closest_goal = goal_pos.copy()
 
-		# --- Two nearest neighbors (rotated) ---
-		neighbor_dists = []
-		for other in world.agents:
-			if other is agent:
-				continue
-			rel_pos_world = other.state.p_pos - agent_pos
-			dist = float(np.linalg.norm(rel_pos_world))
-			neighbor_dists.append((dist, rel_pos_world))
+	# 	# --- Two nearest neighbors (rotated) ---
+	# 	neighbor_dists = []
+	# 	for other in world.agents:
+	# 		if other is agent:
+	# 			continue
+	# 		rel_pos_world = other.state.p_pos - agent_pos
+	# 		dist = float(np.linalg.norm(rel_pos_world))
+	# 		neighbor_dists.append((dist, rel_pos_world))
 
-		neighbor_dists.sort(key=lambda x: x[0])
-		nearest = [n[1] for n in neighbor_dists[:2]]
-		while len(nearest) < 2:
-			nearest.append(np.zeros(world.dim_p, dtype=np.float32))
+	# 	neighbor_dists.sort(key=lambda x: x[0])
+	# 	nearest = [n[1] for n in neighbor_dists[:2]]
+	# 	while len(nearest) < 2:
+	# 		nearest.append(np.zeros(world.dim_p, dtype=np.float32))
 
-		# Rotate each neighbor vector into ego frame, then flatten to 4 slots
-		rotated_neighbors = [
-			get_rotated_position_from_relative(np.asarray(vec, dtype=np.float32), agent_heading).astype(np.float32)
-			for vec in nearest
-		]
-		nearest_neighbors = np.concatenate(rotated_neighbors, axis=0)
+	# 	# Rotate each neighbor vector into ego frame, then flatten to 4 slots
+	# 	rotated_neighbors = [
+	# 		get_rotated_position_from_relative(np.asarray(vec, dtype=np.float32), agent_heading).astype(np.float32)
+	# 		for vec in nearest
+	# 	]
+	# 	nearest_neighbors = np.concatenate(rotated_neighbors, axis=0)
 
-		# --- Tube params (rotated entrance/exit vectors + width + phase) ---
-		tube_entrance = np.asarray(world.tube_params['entrance'], dtype=np.float32)
-		tube_exit = np.asarray(world.tube_params['exit'], dtype=np.float32)
-		tube_width = float(world.tube_params['width'])
+	# 	# --- Tube params (rotated entrance/exit vectors + width + phase) ---
+	# 	tube_entrance = np.asarray(world.tube_params['entrance'], dtype=np.float32)
+	# 	tube_exit = np.asarray(world.tube_params['exit'], dtype=np.float32)
+	# 	tube_width = float(world.tube_params['width'])
 
-		rel_to_entrance_world = tube_entrance - agent_pos
-		rel_to_exit_world = tube_exit - agent_pos
+	# 	rel_to_entrance_world = tube_entrance - agent_pos
+	# 	rel_to_exit_world = tube_exit - agent_pos
 
-		rot_rel_entrance = get_rotated_position_from_relative(rel_to_entrance_world, agent_heading).astype(np.float32)
-		rot_rel_exit = get_rotated_position_from_relative(rel_to_exit_world, agent_heading).astype(np.float32)
+	# 	rot_rel_entrance = get_rotated_position_from_relative(rel_to_entrance_world, agent_heading).astype(np.float32)
+	# 	rot_rel_exit = get_rotated_position_from_relative(rel_to_exit_world, agent_heading).astype(np.float32)
 
-		# Phase is computed in world coords; keep as scalar to preserve layout
-		phase = float(self.get_agent_phase(agent, world))
+	# 	# Phase is computed in world coords; keep as scalar to preserve layout
+	# 	phase = float(self.get_agent_phase(agent, world))
 
-		tube_params = np.concatenate([
-			rot_rel_entrance,              
-			rot_rel_exit,                  
-			np.array([tube_width], dtype=np.float32),
-			np.array([phase], dtype=np.float32)
-		], axis=0)
+	# 	tube_params = np.concatenate([
+	# 		rot_rel_entrance,              
+	# 		rot_rel_exit,                  
+	# 		np.array([tube_width], dtype=np.float32),
+	# 		np.array([phase], dtype=np.float32)
+	# 	], axis=0)
 
-		# --- Assemble final obs in the SAME field order as before ---
-		# [agent_pos(2), agent_vel(2), goal_pos(2), closest_goal_occupied(1),
-		#  rel_second_closest_goal(2), nearest_neighbors(4), tube_params(6)] = 19 dims
-		return np.concatenate([
-			ego_agent_pos.astype(np.float32),   # was agent_pos; now [0,0] in ego frame
-			rot_agent_vel,                      # rotated self velocity (2 slots)
-			goal_pos,                           # rotated goal vector
-			closest_goal_occupied,              # unchanged scalar
-			rel_second_closest_goal,            # keep same as goal_pos (rotated)
-			nearest_neighbors,                  # two rotated neighbor vectors
-			tube_params                         # rotated entrance/exit + width + phase
-		], axis=0).astype(np.float32)
+	# 	# --- Assemble final obs in the SAME field order as before ---
+	# 	# [agent_pos(2), agent_vel(2), goal_pos(2), closest_goal_occupied(1),
+	# 	#  rel_second_closest_goal(2), nearest_neighbors(4), tube_params(6)] = 19 dims
+	# 	return np.concatenate([
+	# 		ego_agent_pos.astype(np.float32),   # was agent_pos; now [0,0] in ego frame
+	# 		rot_agent_vel,                      # rotated self velocity (2 slots)
+	# 		goal_pos,                           # rotated goal vector
+	# 		closest_goal_occupied,              # unchanged scalar
+	# 		rel_second_closest_goal,            # keep same as goal_pos (rotated)
+	# 		nearest_neighbors,                  # two rotated neighbor vectors
+	# 		tube_params                         # rotated entrance/exit + width + phase
+	# 	], axis=0).astype(np.float32)
 
 
 
@@ -1488,7 +1690,7 @@ class Scenario(BaseScenario):
 
 		return np.hstack([vel, pos, goal_pos, entity_type])
 
-	'''
+
 	def _get_entity_feat_relative(self, agent:Agent, entity:Entity, world:World, fairness_param: np.ndarray) -> arr:
 		"""
 			Returns: ([velocity, position, goal_pos, entity_type])
@@ -1567,82 +1769,82 @@ class Scenario(BaseScenario):
 		else:
 			raise ValueError(f'{entity.name} not supported')
 		return np.hstack([rel_vel, rel_pos, rel_goal_pos,goal_occupied,entity_type])
-	'''
 
 
-	def _get_entity_feat_relative(self, agent: Agent, entity: Entity, world: World, fairness_param: np.ndarray) -> arr:
-		"""
-		Returns rotation-invariant node features for `entity` relative to `agent`.
 
-		Agents/Landmarks/Obstacles:
-			[rel_vel(2), rel_pos(2), rel_goal_pos(2), goal_occupied(1), entity_type(1)]
+	# def _get_entity_feat_relative(self, agent: Agent, entity: Entity, world: World, fairness_param: np.ndarray) -> arr:
+	# 	"""
+	# 	Returns rotation-invariant node features for `entity` relative to `agent`.
 
-		Walls:
-			[rel_vel(2), rel_pos(2), rel_goal_pos(2), goal_occupied(1),
-			goal_history(1), wall_o_corner(2), wall_d_corner(2), entity_type(1)]
-		"""
-		# --- Ego (reference) state ---
-		agent_pos = np.asarray(agent.state.p_pos, dtype=np.float32)
-		agent_vel = np.asarray(agent.state.p_vel, dtype=np.float32)
-		agent_heading = float(getattr(agent.state, "theta", getattr(agent.state, "p_ang", 0.0)))
+	# 	Agents/Landmarks/Obstacles:
+	# 		[rel_vel(2), rel_pos(2), rel_goal_pos(2), goal_occupied(1), entity_type(1)]
 
-		# --- Entity relative vectors in WORLD frame ---
-		entity_pos_world = np.asarray(entity.state.p_pos, dtype=np.float32)
-		entity_vel_world = np.asarray(entity.state.p_vel, dtype=np.float32)
-		rel_pos_world = entity_pos_world - agent_pos
-		rel_vel_world = entity_vel_world - agent_vel
+	# 	Walls:
+	# 		[rel_vel(2), rel_pos(2), rel_goal_pos(2), goal_occupied(1),
+	# 		goal_history(1), wall_o_corner(2), wall_d_corner(2), entity_type(1)]
+	# 	"""
+	# 	# --- Ego (reference) state ---
+	# 	agent_pos = np.asarray(agent.state.p_pos, dtype=np.float32)
+	# 	agent_vel = np.asarray(agent.state.p_vel, dtype=np.float32)
+	# 	agent_heading = float(getattr(agent.state, "theta", getattr(agent.state, "p_ang", 0.0)))
 
-		# --- Rotate into ego (agent) frame ---
-		rel_pos = get_rotated_position_from_relative(rel_pos_world, agent_heading).astype(np.float32)
-		rel_vel = get_rotated_position_from_relative(rel_vel_world, agent_heading).astype(np.float32)
+	# 	# --- Entity relative vectors in WORLD frame ---
+	# 	entity_pos_world = np.asarray(entity.state.p_pos, dtype=np.float32)
+	# 	entity_vel_world = np.asarray(entity.state.p_vel, dtype=np.float32)
+	# 	rel_pos_world = entity_pos_world - agent_pos
+	# 	rel_vel_world = entity_vel_world - agent_vel
 
-		if 'agent' in entity.name:
-			# Each agent's goal is the matched landmark pose
-			goal_pos_world = np.asarray(self.landmark_poses[self.goal_match_index[entity.id]], dtype=np.float32)
-			rel_goal_pos_world = goal_pos_world - agent_pos
-			rel_goal_pos = get_rotated_position_from_relative(rel_goal_pos_world, agent_heading).astype(np.float32)
+	# 	# --- Rotate into ego (agent) frame ---
+	# 	rel_pos = get_rotated_position_from_relative(rel_pos_world, agent_heading).astype(np.float32)
+	# 	rel_vel = get_rotated_position_from_relative(rel_vel_world, agent_heading).astype(np.float32)
 
-			goal_occupied = np.array([self.landmark_poses_occupied[self.goal_match_index[entity.id]]], dtype=np.float32)
-			entity_type = np.array([entity_mapping['agent']], dtype=np.float32)
+	# 	if 'agent' in entity.name:
+	# 		# Each agent's goal is the matched landmark pose
+	# 		goal_pos_world = np.asarray(self.landmark_poses[self.goal_match_index[entity.id]], dtype=np.float32)
+	# 		rel_goal_pos_world = goal_pos_world - agent_pos
+	# 		rel_goal_pos = get_rotated_position_from_relative(rel_goal_pos_world, agent_heading).astype(np.float32)
 
-			return np.hstack([rel_vel, rel_pos, rel_goal_pos, goal_occupied, entity_type]).astype(np.float32)
+	# 		goal_occupied = np.array([self.landmark_poses_occupied[self.goal_match_index[entity.id]]], dtype=np.float32)
+	# 		entity_type = np.array([entity_mapping['agent']], dtype=np.float32)
 
-		elif 'landmark' in entity.name:
-			# For landmarks, the "goal" is its own position relative to ego
-			rel_goal_pos = rel_pos.copy()
-			goal_occupied = np.array([1.0], dtype=np.float32)
-			entity_type = np.array([entity_mapping['landmark']], dtype=np.float32)
+	# 		return np.hstack([rel_vel, rel_pos, rel_goal_pos, goal_occupied, entity_type]).astype(np.float32)
 
-			return np.hstack([rel_vel, rel_pos, rel_goal_pos, goal_occupied, entity_type]).astype(np.float32)
+	# 	elif 'landmark' in entity.name:
+	# 		# For landmarks, the "goal" is its own position relative to ego
+	# 		rel_goal_pos = rel_pos.copy()
+	# 		goal_occupied = np.array([1.0], dtype=np.float32)
+	# 		entity_type = np.array([entity_mapping['landmark']], dtype=np.float32)
 
-		elif 'obstacle' in entity.name:
-			# Same layout as landmarks
-			rel_goal_pos = rel_pos.copy()
-			goal_occupied = np.array([1.0], dtype=np.float32)
-			entity_type = np.array([entity_mapping['obstacle']], dtype=np.float32)
+	# 		return np.hstack([rel_vel, rel_pos, rel_goal_pos, goal_occupied, entity_type]).astype(np.float32)
 
-			return np.hstack([rel_vel, rel_pos, rel_goal_pos, goal_occupied, entity_type]).astype(np.float32)
+	# 	elif 'obstacle' in entity.name:
+	# 		# Same layout as landmarks
+	# 		rel_goal_pos = rel_pos.copy()
+	# 		goal_occupied = np.array([1.0], dtype=np.float32)
+	# 		entity_type = np.array([entity_mapping['obstacle']], dtype=np.float32)
 
-		elif 'wall' in entity.name:
-			# For walls, include rotated corner points as you already did
-			rel_goal_pos = rel_pos.copy()
-			goal_occupied = np.array([1.0], dtype=np.float32)
-			goal_history = np.array([entity.id if entity.id is not None else 0], dtype=np.float32)
-			entity_type = np.array([entity_mapping['wall']], dtype=np.float32)
+	# 		return np.hstack([rel_vel, rel_pos, rel_goal_pos, goal_occupied, entity_type]).astype(np.float32)
 
-			# Compute wall corners in WORLD frame, then rotate into ego frame
-			# (Assumes your wall encodes a segment via endpoints[] along 'axis_pos' with a width)
-			wall_o_corner_world = np.array([entity.endpoints[0], entity.axis_pos + entity.width / 2.0], dtype=np.float32) - agent_pos
-			wall_d_corner_world = np.array([entity.endpoints[1], entity.axis_pos - entity.width / 2.0], dtype=np.float32) - agent_pos
-			wall_o_corner = get_rotated_position_from_relative(wall_o_corner_world, agent_heading).astype(np.float32)
-			wall_d_corner = get_rotated_position_from_relative(wall_d_corner_world, agent_heading).astype(np.float32)
+	# 	elif 'wall' in entity.name:
+	# 		# For walls, include rotated corner points as you already did
+	# 		rel_goal_pos = rel_pos.copy()
+	# 		goal_occupied = np.array([1.0], dtype=np.float32)
+	# 		goal_history = np.array([entity.id if entity.id is not None else 0], dtype=np.float32)
+	# 		entity_type = np.array([entity_mapping['wall']], dtype=np.float32)
 
-			return np.hstack([
-				rel_vel, rel_pos, rel_goal_pos, goal_occupied, goal_history, wall_o_corner, wall_d_corner, entity_type
-			]).astype(np.float32)
+	# 		# Compute wall corners in WORLD frame, then rotate into ego frame
+	# 		# (Assumes your wall encodes a segment via endpoints[] along 'axis_pos' with a width)
+	# 		wall_o_corner_world = np.array([entity.endpoints[0], entity.axis_pos + entity.width / 2.0], dtype=np.float32) - agent_pos
+	# 		wall_d_corner_world = np.array([entity.endpoints[1], entity.axis_pos - entity.width / 2.0], dtype=np.float32) - agent_pos
+	# 		wall_o_corner = get_rotated_position_from_relative(wall_o_corner_world, agent_heading).astype(np.float32)
+	# 		wall_d_corner = get_rotated_position_from_relative(wall_d_corner_world, agent_heading).astype(np.float32)
 
-		else:
-			raise ValueError(f'{entity.name} not supported')
+	# 		return np.hstack([
+	# 			rel_vel, rel_pos, rel_goal_pos, goal_occupied, goal_history, wall_o_corner, wall_d_corner, entity_type
+	# 		]).astype(np.float32)
+
+	# 	else:
+	# 		raise ValueError(f'{entity.name} not supported')
 
 
 

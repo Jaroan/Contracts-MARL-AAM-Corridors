@@ -2,7 +2,7 @@ import numpy as np
 
 
 class AirTaxiConfig():
-    V_MIN = 60 * 0.514444 * 0.001 # knots to km/s
+    V_MIN = 60 * 0.514444 * 0.001 # knots to km/s 
     V_MAX = 175 * 0.514444  * 0.001 # knots to km/s
     V_NOMINAL = 110 * 0.514444  * 0.001 # knots to km/s
     ACCEL_MIN = -0.001 # km/s^2
@@ -25,6 +25,8 @@ class AirTaxiConfig():
     # Ref: Preliminary Analysis of Separation Standards for Urban Air Mobility Using Unmitigated Fast-Time
     # Test params: 1500, 1800, 2200, 5000 ft
     SEPARATION_DISTANCE = 1500 * 0.0003048 # (first parameter in ft, converted to km)
+    COLLISION_DISTANCE = SEPARATION_DISTANCE
+
     # COORDINATION_RANGE = 5 # 3 miles to km
     COORDINATION_RANGE = 3 * 1.60934 # 3 miles to km
     VALUE_FUNCTION_FILE_NAME = 'data/airtaxi_value_function.pkl'
@@ -114,12 +116,40 @@ class DoubleIntegratorConfig():
     GOAL_HEADING_THRESHOLD = np.pi
 
 
-class RewardWeightConfig():
-    # min and max reward at each timestep.
-    MIN_REWARD = -40
-    MAX_REWARD = 50
+# class RewardWeightConfig():
+#     # min and max reward at each timestep.
+#     MIN_REWARD = -40
+#     MAX_REWARD = 50
     
-    GOAL_REACH = 50
-    CONFLICT = -20 # if agent is within separation distance of another agent
+#     GOAL_REACH = 50
+#     CONFLICT = -20 # if agent is within separation distance of another agent
 
 eval_scenario_type = "left_to_right_merge_and_land"
+
+
+
+
+class RewardWeightConfig():
+    # min and max reward at each timestep.
+
+    MIN_REWARD = -40
+    MAX_REWARD = 50
+
+    GOAL_REACH = 50
+    SAFETY_VIOLATION = -20 # if agent is within separation distance of another agent
+
+    HJ_VALUE = -2 # safety value function is given as penalty. this is a multiplication weight.
+    POTENTIAL_CONFLICT = -1 # if multiple agents are within the engagement distance of the agent.
+    DIFF_FROM_FILTERED_ACTION = -1 # penalty if unfiltered MARL action is different from filtered action.
+
+
+class RewardBinaryConfig():
+    # fyi, goal_reach_reward is always true since it is the main reward term form performance.     
+    # Usually, only one of CONFLICT or CONFLICT_VALUE is used.
+
+    SAFETY_VIOLATION = False
+    HJ_VALUE = False
+    POTENTIAL_CONFLICT = False
+    SEPARATION_DISTANCE_CURRICULUM = False
+    INITIAL_PHASE_USE_SAFETY_FILTER = False
+    DIFF_FROM_FILTERED_ACTION = False

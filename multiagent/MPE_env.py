@@ -65,6 +65,9 @@ def GraphMPEEnv(args):
     world = scenario.make_world(args=args)
     from multiagent.environment import MultiAgentGraphEnv
     # create multiagent environment
+    
+
+    ## add in the multidiscrte action space information here
     env = MultiAgentGraphEnv(world=world, reset_callback=scenario.reset_world,
                         reward_callback=scenario.reward, 
                         observation_callback=scenario.observation,
@@ -73,7 +76,9 @@ def GraphMPEEnv(args):
                         id_callback=scenario.get_id,
                         info_callback=scenario.info_callback,
                         done_callback=scenario.done,
+                        agent_reached_goal_callback=scenario.get_agent_reached_goal,
                         scenario_name=args.scenario_name,
+                        discrete_action=args.discrete_action,
                         dynamics_type=args.dynamics_type)
 
     return env

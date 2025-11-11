@@ -62,18 +62,11 @@ class Runner(object):
 
 		# if not testing model
 		if not self.use_render:
-			if self.use_wandb:
-				self.save_dir = str(wandb.run.dir)
-				self.run_dir = str(wandb.run.dir)
-			else:
-				self.run_dir = config["run_dir"]
-				self.log_dir = str(self.run_dir / 'logs')
-				if not os.path.exists(self.log_dir):
-					os.makedirs(self.log_dir)
-				self.writter = SummaryWriter(self.log_dir)
-				self.save_dir = str(self.run_dir / 'models')
-				if not os.path.exists(self.save_dir):
-					os.makedirs(self.save_dir)
+			import wandb
+			self.run_dir = str(wandb.run.dir)
+			self.save_dir = os.path.join(self.run_dir, "models")
+			os.makedirs(self.save_dir, exist_ok=True)
+
 
 		if self.all_args.env_name == "GraphMPE":
 			from onpolicy.algorithms.graph_mappo import GR_MAPPO as TrainAlgo
@@ -130,6 +123,10 @@ class Runner(object):
 											self.envs.observation_space[0],
 											share_observation_space,
 											self.envs.action_space[0])
+		# --- make writer safe in all modes ---
+		if not hasattr(self, "writter"):
+			self.writter = None
+
 
 	def run(self):
 		"""Collect training data, perform training updates, and evaluate policy."""
@@ -292,35 +289,19 @@ class Runner(object):
 			# print("CONFORMANCE", conformance_percentages_list)
 		return env_infos
 
-	def log_train(self, train_infos:Dict, total_num_steps:int):
-		"""
-		Log training info.
-		train_infos: (dict) 
-			information about training update.
-		total_num_steps: (int) 
-			total number of training env steps.
-		"""
+	def log_train(self, train_infos: Dict, total_num_steps: int):
+		import wandb
 		for k, v in train_infos.items():
-			if self.use_wandb:
-				wandb.log({k: v}, step=total_num_steps)
-			else:
-				self.writter.add_scalars(k, {k: v}, total_num_steps)
+			wandb.log({k: v}, step=total_num_steps)
 
-	def log_env(self, env_infos:Dict, total_num_steps:int):
-		"""
-		Log env info.
-		env_infos: (dict) 
-			information about env state.
-		total_num_steps: (int) 
-			total number of training env steps.
-		"""
+
+	def log_env(self, env_infos: Dict, total_num_steps: int):
+		import wandb
 		for k, v in env_infos.items():
-			# print("k", k, "v",v)
-			if len(v)>0:
-				if self.use_wandb:
-					wandb.log({k: np.mean(v)}, step=total_num_steps)
-				else:
-					self.writter.add_scalars(k, {k: np.mean(v)}, total_num_steps)
+			if len(v) > 0:
+				wandb.log({k: np.mean(v)}, step=total_num_steps)
+
+
 
 	def get_fairness_metric(self, env_infos:Dict):
 		"""
