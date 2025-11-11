@@ -100,6 +100,16 @@ def parse_args(args, parser):
                         "when agent has reached the goal or just return False like "
                         "the `simple.py` or `simple_spread.py`")
 
+    parser.add_argument("--use_safety_filter", type=lambda x: bool(strtobool(x)), default=False,
+                        help="Enable Layered-Safe-MARL safety filter.")
+    parser.add_argument("--safety_filter_type", type=str, default="hj",
+                        choices=["hj", "cbf", "exp_cbf"], help="Type of safety filter (HJ, CBF, or exponential CBF).")
+    parser.add_argument("--safety_value_fn", type=str, default="data/airtaxi_value_function.pkl",
+                        help="Path to AirTaxi HJ reachability value function.")
+    parser.add_argument("--safety_ttr_fn", type=str, default="data/airtaxi_ttr_function.pkl",
+                        help="Path to AirTaxi TTR function (optional).")
+    parser.add_argument("--terminate_on_violation", type=lambda x: bool(strtobool(x)), default=False)
+    parser.add_argument("--safety_penalty", type=float, default=20.0)
 
     all_args = parser.parse_known_args(args)[0]
 

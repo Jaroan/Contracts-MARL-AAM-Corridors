@@ -24,6 +24,7 @@ def make_render_env(all_args:argparse.Namespace):
                 env = MPEEnv(all_args)
             elif all_args.env_name == "GraphMPE":
                 env = GraphMPEEnv(all_args)
+
             else:
                 print(f"Can not support the {all_args.env_name} environment.")
                 raise NotImplementedError
@@ -69,47 +70,87 @@ def parse_args(args, parser):
                         default=True, help="Whether we want to use the 'done=True' " 
                         "when agent has reached the goal or just return False like "
                         "the `simple.py` or `simple_spread.py`")
+    '''
+    parser.add_argument("--dynamics_type", type=str,
+                        default="unicycle_vehicle",
+                        choices=["unicycle_vehicle", "double_integrator", "air_taxi"],
+                        help="Dynamics model type for agents.")
+    '''
+
+    parser.add_argument("--use_safety_filter", type=lambda x: bool(strtobool(x)), default=False,
+                        help="Enable Layered-Safe-MARL safety filter.")
+    parser.add_argument("--safety_filter_type", type=str, default="hj",
+                        choices=["hj", "cbf", "exp_cbf"], help="Type of safety filter (HJ, CBF, or exponential CBF).")
+    parser.add_argument("--safety_value_fn", type=str, default="data/airtaxi_value_function.pkl",
+                        help="Path to AirTaxi HJ reachability value function.")
+    parser.add_argument("--safety_ttr_fn", type=str, default="data/airtaxi_ttr_function.pkl",
+                        help="Path to AirTaxi TTR function (optional).")
+    parser.add_argument("--terminate_on_violation", type=lambda x: bool(strtobool(x)), default=False)
+    parser.add_argument("--safety_penalty", type=float, default=20.0)
+
 
     all_args = parser.parse_known_args(args)[0]
 
     return all_args
 
-def modify_args(model_dir:str, 
-                args:argparse.Namespace, 
-                exclude_args:list=['model_dir', 'num_agents', 'num_obstacles', 
-                                'num_landmarks', 'render_episodes', 'world_size',
-                                'seed', 'save_gifs', 'use_render', 'episode_length',
-                                'use_dones', 'goal_rew','collaborative', 
-                                'min_dist_thresh', 'scenario_name','fair_rew','model_name',
-                                'num_walls','zero_shift','min_obs_dist','max_edge_dist','total_actions',
-                                'formation_type', 'formation_rew']):
-    """
-        Modify the args used to train the model
-    """
-    import yaml
-    with open(str(model_dir) + '/config.yaml') as f:
-        ydict = yaml.safe_load(f)
 
-    print('_'*50)
+def modify_args(model_dir: str,
+                args: argparse.Namespace,
+                exclude_args: list = [
+                    'model_dir', 'num_agents', 'num_obstacles',
+                    'num_landmarks', 'render_episodes', 'world_size',
+                    'seed', 'save_gifs', 'use_render', 'episode_length',
+                    'use_dones', 'goal_rew', 'collaborative',
+                    'min_dist_thresh', 'scenario_name', 'fair_rew', 'model_name',
+                    'num_walls', 'zero_shift', 'min_obs_dist', 'max_edge_dist',
+                    'total_actions', 'formation_type', 'formation_rew'
+                ]):
+    """
+    Load config.yaml from model_dir if available; otherwise, use a local config.yaml.
+    CLI args always take priority. 
+    """
+    import os, yaml
+
+    # 1️⃣ Attempt to load config from model_dir
+    config_path = os.path.join(str(model_dir), "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            ydict = yaml.safe_load(f)
+        print(f"[CONFIG] Loaded config from {config_path}")
+    # 2️⃣ Fall back to manual config.yaml in current dir
+    elif os.path.exists("config.yaml"):
+        with open("config.yaml", "r") as f:
+            ydict = yaml.safe_load(f)
+        print("[CONFIG] Loaded manual config.yaml from working directory")
+    else:
+        print("[CONFIG] No config.yaml found — using CLI args only.")
+        ydict = {}
+
+    print("_" * 50)
     for k, v in ydict.items():
         if k in exclude_args:
-            print(f"Using {k} = {vars(args)[k]}")
-            # print(f"Skipping {k} with value {args.k}")
+            if hasattr(args, k):
+                print(f"Keeping CLI-provided {k} = {getattr(args, k)}")
             continue
-        # all args have 'values' and 'desc' as keys
-        if type(v) == dict:
-            if 'value' in v.keys():
-                # print(f'Setting attr {k} to {ydict[k]["value"]}')
-                setattr(args, k, ydict[k]['value'])
-    print('_'*50)
 
-    # set some args manually
+        # Handle nested YAML values or direct scalars
+        new_val = v['value'] if isinstance(v, dict) and 'value' in v else v
+
+        # Only fill missing or None values
+        if not hasattr(args, k) or getattr(args, k) is None:
+            setattr(args, k, new_val)
+            print(f"Loaded {k} = {new_val} from config.yaml")
+    print("_" * 50)
+
+    # 3️⃣ Apply manual overrides for eval
     args.cuda = False
     args.use_wandb = False
     args.use_render = True
-    # args.save_gifs = True
     args.n_rollout_threads = 1
+
     return args
+
+
 
 def main(args):
     # model_dir = 'trained_models/navigation/Navigation/rmappo/wandb/offline-run-20210720_220614-1eqhk4l1/files'

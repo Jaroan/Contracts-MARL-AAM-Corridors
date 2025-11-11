@@ -203,6 +203,11 @@ def get_config():
     
     parser.add_argument('--model_name', type=str,
                         default='FA_FR', help="Which model to run on")
+    
+    # continuous action_space multiDiscrete
+    parser.add_argument("--discrete_action", type=lambda x:bool(strtobool(x)), default=True,
+                        help="discrete action space")
+    
     # prepare parameters
     parser.add_argument("--algorithm_name", type=str,
                         default='rmappo', choices=["rmappo", "mappo"])

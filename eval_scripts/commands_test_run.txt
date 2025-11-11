@@ -1,5 +1,5 @@
 python onpolicy/scripts/eval_mpe.py \
---model_dir='model_weights/tube/rot_inv' \
+--model_dir='model_weights/tube/rot_inv/airtaxi' \
 --render_episodes=2 \
 --world_size=3 \
 --num_agents=3 \
@@ -9,7 +9,7 @@ python onpolicy/scripts/eval_mpe.py \
 --episode_length=200 \
 --use_dones=False \
 --collaborative=False --model_name='FA' \
---scenario_name='nav_metered_one_goal_graph_rotate_tube_july' \
+--scenario_name='nav_graph_metered_single_corridor_rot_inv' \
 --dynamics_type='air_taxi' \
 --goal_rew=30 \
 --fair_rew=1 \

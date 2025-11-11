@@ -6,7 +6,8 @@ import random
 from typing import Callable, List, Tuple, Dict, Union, Optional
 from multiagent.core import EntityDynamicsType, World, Agent, is_list_of_lists
 from multiagent.multi_discrete import MultiDiscrete
-from multiagent.config import DoubleIntegratorConfig, UnicycleVehicleConfig
+from multiagent.config import DoubleIntegratorConfig, UnicycleVehicleConfig, AirTaxiConfig
+from pyglet import image
 
 # update bounds to center around agent
 cam_range = 2
@@ -33,6 +34,7 @@ class MultiAgentBaseEnv(gym.Env):
 					dynamics_type:str='unicycle_vehicle') -> None:
 		self.world = world
 		self.world_length = self.world.world_length
+		self.world_aspect_ratio = self.world.world_aspect_ratio
 		self.current_step = 0
 		self.agents = self.world.policy_agents
 		# set required vectorized gym env property
@@ -49,6 +51,7 @@ class MultiAgentBaseEnv(gym.Env):
 		self.scenario_name = scenario_name
 
 		self.world_size = self.world.world_size
+		self.with_background = self.world.with_background
 
 		# environment parameters
 		# self.discrete_action_space = True
@@ -66,8 +69,14 @@ class MultiAgentBaseEnv(gym.Env):
 			# self.num_accel_x_options = DoubleIntegratorConfig.ACCELX_OPTIONS
 			# self.num_discrete_action = self.num_accel_x_options * self.num_accel_y_options
 			self.num_discrete_action = self.world.total_actions
+		elif dynamics_type == 'air_taxi':    # <--- add this
+			self.dynamics_type = EntityDynamicsType.AirTaxiXY
+			self.num_accel_options = AirTaxiConfig.MOTION_PRIM_ACCEL_OPTIONS
+			self.num_angle_rate_options = AirTaxiConfig.MOTION_PRIM_ANGRATE_OPTIONS
+			self.num_discrete_action = self.num_accel_options * self.num_angle_rate_options
 		else:
 			raise NotImplementedError
+
 		# if true, action is a number 0...N, 
 		# otherwise action is a one-hot N-dimensional vector
 		self.discrete_action_input = False
@@ -307,6 +316,18 @@ class MultiAgentBaseEnv(gym.Env):
 			# u[..., 0] = accel_x_options[accel_x_index]
 			# u[..., 1] = accel_y_options[accel_y_index]
 			#################################################
+		elif self.dynamics_type == EntityDynamicsType.AirTaxiXY:
+			max_angular_rate = AirTaxiConfig.ANGULAR_RATE_MAX
+			max_accel = AirTaxiConfig.ACCEL_MAX
+			min_accel = AirTaxiConfig.ACCEL_MIN
+			accel_options = np.linspace(min_accel, max_accel, self.num_accel_options)
+			angle_rate_options = np.linspace(-max_angular_rate, max_angular_rate, self.num_angle_rate_options)
+			angle_rate_index = action_index // self.num_accel_options
+			accel_index = action_index % self.num_accel_options
+			u = np.zeros((*action_index.shape, self.world.dim_p))
+			u[..., 0] = angle_rate_options[angle_rate_index]
+			u[..., 1] = accel_options[accel_index]
+
 		else:
 			raise NotImplementedError
 		return u
@@ -413,6 +434,19 @@ class MultiAgentBaseEnv(gym.Env):
 						agent.action.u[0] = angle_rate_options[angle_rate_index]
 						agent.action.u[1] = accel_options[accel_index]
 						action_description = f"turn: {agent.action.u[0]}, accel: {agent.action.u[1]}"
+					elif self.dynamics_type == EntityDynamicsType.AirTaxiXY:
+						agent.action.u = np.zeros(self.world.dim_p)
+						max_angular_rate = AirTaxiConfig.ANGULAR_RATE_MAX
+						max_accel = AirTaxiConfig.ACCEL_MAX
+						min_accel = AirTaxiConfig.ACCEL_MIN
+						accel_options = np.linspace(min_accel, max_accel, self.num_accel_options)
+						angle_rate_options = np.linspace(-max_angular_rate, max_angular_rate, self.num_angle_rate_options)
+						action_index = np.argmax(action[0])
+						angle_rate_index = int(action_index // self.num_accel_options)
+						accel_index = int(action_index - angle_rate_index * self.num_accel_options)
+						agent.action.u[0] = angle_rate_options[angle_rate_index]
+						agent.action.u[1] = accel_options[accel_index]
+						action_description = f"turn: {agent.action.u[0]}, accel: {agent.action.u[1]}"
 					else:
 						raise NotImplementedError
 					# if len(action[0]) == 5:
@@ -481,6 +515,7 @@ class MultiAgentBaseEnv(gym.Env):
 						message += (other.name + ' to ' + agent.name + ': ' + word + '   ')
 			# print(message)
 
+		default_height = 700
 		for i in range(len(self.viewers)):
 			# create viewers (if necessary)
 			if self.viewers[i] is None:
@@ -488,7 +523,11 @@ class MultiAgentBaseEnv(gym.Env):
 				# (and don't import for headless machines)
 				# from gym.envs.classic_control import rendering
 				from multiagent import rendering
-				self.viewers[i] = rendering.Viewer(700,700)
+				self.viewers[i] = rendering.Viewer(int(self.world_aspect_ratio * default_height),
+												   int(default_height))
+    
+		cam_range_height = self.world_size
+		cam_range_width = self.world_size * self.world_aspect_ratio
 
 		# create rendering geometry
 		if self.render_geoms is None:
@@ -773,10 +812,10 @@ class MultiAgentBaseEnv(gym.Env):
 				pos = np.zeros(self.world.dim_p)
 			else:
 				pos = self.agents[i].state.p_pos
-			self.viewers[i].set_bounds(pos[0]-self.world.world_size,
-										pos[0]+self.world.world_size,
-										pos[1]-self.world.world_size,
-										pos[1]+self.world.world_size)
+			self.viewers[i].set_bounds(pos[0]- cam_range_width,
+										pos[0]+ cam_range_width,
+										pos[1]-cam_range_height,
+										pos[1]+cam_range_height)
 			# update geometry positions
 			for e, entity in enumerate(self.world.entities):
 				self.render_geoms_xform[e].set_translation(*entity.state.p_pos)
@@ -794,8 +833,10 @@ class MultiAgentBaseEnv(gym.Env):
 					# print("delta_theta",delta_theta)
 					# input("Press Enter to continue...")
 					self.render_geoms_xform[e].set_rotation(delta_theta)
-					self.render_geoms[e].set_color(*entity.color, alpha=0.8)
-					# self.agent_separation_geoms[e].set_color(0, 0, 0, alpha=0.1)
+					# entity.initial_theta = entity.state.theta
+					alpha = 1.0 if self.with_background else 0.8
+					self.render_geoms[e].set_color(*entity.color, alpha=alpha)
+
 					if not entity.silent:
 						for ci in range(self.world.dim_c):
 							color = 1 - entity.state.c[ci]
@@ -913,7 +954,7 @@ class MultiAgentGraphEnv(MultiAgentBaseEnv):
 					shared_viewer:bool=True, 
 					discrete_action:bool=True,
 					scenario_name:str='navigation',
-					dynamics_type:str='double_integrator') -> None:
+					dynamics_type:str='airtaxi') -> None:
 		super(MultiAgentGraphEnv, self).__init__(world, reset_callback, 
 											reward_callback,observation_callback, 
 											info_callback,done_callback, agent_reached_goal_callback,
