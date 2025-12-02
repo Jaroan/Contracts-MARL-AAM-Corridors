@@ -12,7 +12,8 @@ from numpy import ndarray as arr
 from scipy import sparse
 
 # import scipy.spatial.distance as dist
-import os,sys
+import os
+import sys
 sys.path.append(os.path.abspath(os.getcwd()))
 
 # import numba
@@ -28,46 +29,48 @@ from multiagent.custom_scenarios.utils import *
 entity_mapping = {'agent': 0, 'landmark': 1, 'obstacle':2, 'wall':3}
 
 
-
 def direction_alignment_error(theta, theta_ref):
-    """Smallest absolute angle difference in [0, pi]."""
-    d = (theta - theta_ref + np.pi) % (2*np.pi) - np.pi
-    return abs(d)
+	"""Smallest absolute angle difference in [0, pi]."""
+	d = (theta - theta_ref + np.pi) % (2*np.pi) - np.pi
+	return abs(d)
+
 
 def cross_track_error(agent_pos, agent_heading, goal_pos):
-    """
-    Signed cross-track distance from agent_pos to the ray starting at goal_pos
-    and pointing along agent_heading.
-    Returns |cross-track| in [0,1] approx by soft-bounding.
-    """
-    # Ray direction
-    ray = np.array([np.cos(agent_heading), np.sin(agent_heading)])
-    v = agent_pos - goal_pos
-    # cross-track magnitude = |v x ray| (2D cross product magnitude)
-    c = abs(v[0]*ray[1] - v[1]*ray[0])
-    # Soft-normalize: treat >1 as 1
-    return float(np.clip(c, 0, 1))
+	"""
+	Signed cross-track distance from agent_pos to the ray starting at goal_pos
+	and pointing along agent_heading.
+	Returns |cross-track| in [0,1] approx by soft-bounding.
+	"""
+	# Ray direction
+	ray = np.array([np.cos(agent_heading), np.sin(agent_heading)])
+	v = agent_pos - goal_pos
+	# cross-track magnitude = |v x ray| (2D cross product magnitude)
+	c = abs(v[0]*ray[1] - v[1]*ray[0])
+	# Soft-normalize: treat >1 as 1
+	return float(np.clip(c, 0, 1))
+
 
 def get_relative_position_from_reference(p, pref, heading_ref):
-    """Rotate (p - pref) into the frame aligned with heading_ref."""
-    d = p - pref
-    c, s = np.cos(heading_ref), np.sin(heading_ref)
-    R = np.array([[c, s], [-s, c]])  # frame where +x is along heading_ref
-    return R @ d
+	"""Rotate (p - pref) into the frame aligned with heading_ref."""
+	d = p - pref
+	c, s = np.cos(heading_ref), np.sin(heading_ref)
+	R = np.array([[c, s], [-s, c]])  # frame where +x is along heading_ref
+	return R @ d
+
 
 def double_integrator_velocity_error_from_magnetic_field_reference(state, goal, radius=0.2):
-    """
-    LS-MARL uses a heading-aware penalty; for AirTaxi we fallback to distance
-    if we don’t have velocity components. This returns a smooth penalty
-    that’s ~0 near the goal and grows with distance.
-    """
-    p = state.p_pos
-    g = goal.state.p_pos
-    d = np.linalg.norm(p - g)
-    if d <= radius:
-        return 0.0
-    # simple smooth ramp starting after radius
-    return d - radius
+	"""
+	LS-MARL uses a heading-aware penalty; for AirTaxi we fallback to distance
+	if we don’t have velocity components. This returns a smooth penalty
+	that’s ~0 near the goal and grows with distance.
+	"""
+	p = state.p_pos
+	g = goal.state.p_pos
+	d = np.linalg.norm(p - g)
+	if d <= radius:
+		return 0.0
+	# simple smooth ramp starting after radius
+	return d - radius
 
 
 def get_thetas(poses):
@@ -86,6 +89,7 @@ def find_angle(pose):
 		angle += 2 * np.pi
 	return angle
 
+
 # @staticmethod
 # @jit(nopython=True)
 def get_rotated_position_from_relative(relative_position: np.ndarray,
@@ -96,9 +100,10 @@ def get_rotated_position_from_relative(relative_position: np.ndarray,
 	relative_position_rotated = np.dot(rot_matrix, relative_position)
 	return relative_position_rotated
 
+
 def leaky_ReLU(x):
-  data = np.max(max(0.01*x,x))
-  return np.array(data, dtype=float)
+	data = np.maximum(0.01*x, x)
+	return np.array(data, dtype=float)
 
 
 class Scenario(BaseScenario):
@@ -314,8 +319,8 @@ class Scenario(BaseScenario):
 			world.with_background = self.with_background
 		else:
 			world.with_background = False
-		return world
 		self.prev_goal_dist = np.full(self.num_agents, np.inf, dtype=np.float32)
+		return world
 
 	def reset_world(self, world:World, num_current_episode: int = 0) -> None:
 		# print("RESET WORLD")
@@ -1003,7 +1008,7 @@ class Scenario(BaseScenario):
 		# print("back_agent", back_agent.id if back_agent else "None")
 		
 		# Calculate desired spacing based on tube length and number of agents
-		desired_spacing = self.separation_distance  # 3 is the number of agents in the tube TODO: harcoded
+		desired_spacing = self.separation_distance  # separation distance between agents
 		
 		# Track agent's previous phase if not already stored
 		if not hasattr(agent, 'previous_phase'):
@@ -1250,15 +1255,15 @@ class Scenario(BaseScenario):
 		
 		return mean_dist, std_dev_dist, agent_pos
 	
-	def sigmoid(x):
+	def sigmoid(self, x):
 		return 1 / (1 + np.exp(-x))
 	
 	def collect_goal_info(self, world):
-		goal_pos =  np.zeros((self.num_agents, 2)) # create a zero vector with the size of the number of goal and positions of dim 2
+		goal_pos = np.zeros((self.num_agents, 2))  # create a zero vector with the size of the number of goal and positions of dim 2
 		count = 0
 		for goal in world.landmarks:
-			goal_pos[count]= goal.state.p_pos
-			count +=1
+			goal_pos[count] = goal.state.p_pos
+			count += 1
 		return goal_pos
 
 	def graph_observation(self, agent:Agent, world:World) -> Tuple[arr, arr]:
@@ -1279,7 +1284,7 @@ class Scenario(BaseScenario):
 			• Adjacency Matrix (num_entities, num_entities)
 				NOTE: using the distance matrix, need to do some post-processing
 				If `global`:
-					• All close-by entities are connectd together
+					• All close-by entities are connected together
 				If `relative`:
 					• Only entities close to the ego-agent are connected
 			

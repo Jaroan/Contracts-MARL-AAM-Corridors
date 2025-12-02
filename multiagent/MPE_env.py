@@ -37,9 +37,10 @@ def MPEEnv(args:argparse.Namespace):
     """
 
     # load scenario from script
-    scenario = load(args.scenario_name + ".py").Scenario()
-    # create world
+    scenario_module = load(args.scenario_name + ".py")
+    scenario = scenario_module.Scenario(args)   # <-- pass args to constructor
     world = scenario.make_world(args=args)
+
     if args.algorithm_name in ['mappo', 'rmappo']:
         from multiagent.environment import MultiAgentPPOEnv as MultiAgentEnv
     else:
@@ -60,14 +61,12 @@ def GraphMPEEnv(args):
 
     # load scenario from script
     assert 'graph' in args.scenario_name, ("Only use graph env for graph scenarios")
-    scenario = load(args.scenario_name + ".py").Scenario()
+    scenario_module = load(args.scenario_name + ".py")
+    scenario = scenario_module.Scenario(args)   # <-- pass args to constructor
     # create world
     world = scenario.make_world(args=args)
     from multiagent.environment import MultiAgentGraphEnv
     # create multiagent environment
-    
-
-    ## add in the multidiscrte action space information here
     env = MultiAgentGraphEnv(world=world, reset_callback=scenario.reset_world,
                         reward_callback=scenario.reward, 
                         observation_callback=scenario.observation,
@@ -76,9 +75,7 @@ def GraphMPEEnv(args):
                         id_callback=scenario.get_id,
                         info_callback=scenario.info_callback,
                         done_callback=scenario.done,
-                        agent_reached_goal_callback=scenario.get_agent_reached_goal,
                         scenario_name=args.scenario_name,
-                        discrete_action=args.discrete_action,
                         dynamics_type=args.dynamics_type)
 
     return env
