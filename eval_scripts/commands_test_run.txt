@@ -1,22 +1,23 @@
+## If in main branch, this is the same as the basic corridor setup
+
 python onpolicy/scripts/eval_mpe.py \
---model_dir='model_weights/tube/rot_inv/airtaxi' \
+--model_dir='model_weights/tube/rot_inv/airtaxi/two_phase_only' \
 --render_episodes=2 \
 --world_size=3 \
---num_agents=3 \
+--num_agents=5 \
 --num_obstacles=0 \
---seed=1 \
---num_landmarks=3 \
---episode_length=200 \
+--seed=0 \
+--num_landmarks=5 \
+--episode_length=100 \
 --use_dones=False \
---collaborative=False --model_name='FA' \
---scenario_name='nav_graph_metered_single_corridor_rot_inv' \
+--collaborative=False --model_name='TWO' \
+--scenario_name='two_phase_graph' \
 --dynamics_type='air_taxi' \
---goal_rew=30 \
---fair_rew=1 \
+--goal_rew=20 \
+--collision_rew=20 \
 --save_gifs \
 --use_render \
 --num_walls=0 \
---zeroshift=5 \
 --min_obs_dist 0.5 \
 --total_actions 5 \
 --formation_type 'point'
