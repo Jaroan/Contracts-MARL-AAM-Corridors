@@ -1,0 +1,3 @@
+[submodule "hj_reachability_utils"]
+	path = hj_reachability_utils
+	url = https://github.com/ChoiJangho/hj_reachability_utils.git

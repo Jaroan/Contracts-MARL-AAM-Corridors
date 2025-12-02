@@ -1,7 +1,12 @@
+casadi==3.6.5
 cvxpy==1.4.1
 gurobipy==10.0.2
 gym==0.26.2
+flax==0.8.2
+hj-reachability==0.5.0
 imageio==2.31.1
+jax==0.4.25
+jaxlib==0.4.25
 numpy==1.26.4
 pip==23.1.2
 pyglet==1.5.26
